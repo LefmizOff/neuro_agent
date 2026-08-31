@@ -1,0 +1,126 @@
+# Конфигурация Neuro Local Agent
+
+# Ollama настройки
+ollama:
+  base_url: "http://127.0.0.1:11434"
+  vision_model: "qwen2.5vl:7b"
+  llm_model: "qwen2.5:7b-instruct"
+  timeout: 120  # секунд на запрос к LLM
+
+# Настройки безопасности
+security:
+  dry_run: true  # по умолчанию все действия в режиме просмотра
+  emergency_hotkey: "ctrl+alt+q"  # аварийная остановка
+  failsafe_enabled: true  # pyautogui FAILSAFE (курсор в левый верхний угол)
+  
+  # Опасные действия требуют подтверждения
+  dangerous_actions:
+    - "delete_file"
+    - "delete_directory"
+    - "download_and_run"
+    - "system_settings_change"
+    - "send_message"
+    - "purchase"
+    - "open_url"
+  
+  require_confirmation: true  # требовать подтверждение для опасных действий
+
+# Настройки восприятия
+perception:
+  screenshot_interval: 1.0  # секунды между скриншотами
+  ocr_enabled: true
+  ocr_engine: "rapidocr"  # или "tesseract", или "none"
+  ui_detection_enabled: true
+  set_of_mark_enabled: true  # разметка UI элементов рамками
+  max_ui_elements: 20  # максимум элементов для разметки
+  
+# Настройки памяти
+memory:
+  db_path: "data/memory/neuro_memory.db"
+  max_episodes: 10000  # максимум эпизодов в памяти
+  max_facts: 1000
+  max_skills: 500
+  max_errors: 500
+  rerank_top_k: 5  # сколько кандидатов передавать LLM-reranker'у
+  
+# Настройки речи
+speech:
+  tts_enabled: true
+  tts_voice_id: 0  # ID голоса pyttsx3 (0 - первый доступный)
+  tts_rate: 150  # скорость речи (слова в минуту)
+  stt_enabled: false  # STT опционально через vosk
+  stt_language: "ru-RU"
+  
+# Настройки действий
+action:
+  mouse_speed: 0.5  # скорость мыши (0.1-1.0)
+  keyboard_delay: 0.05  # задержка между нажатиями клавиш (сек)
+  click_pause: 0.1  # пауза между кликами (сек)
+  
+# Minecraft плагин
+minecraft:
+  enabled: true
+  window_title: "Minecraft"  # заголовок окна игры
+  use_pydirectinput: true  # использовать pydirectinput вместо pyautogui
+  
+  # Горячие клавиши (по умолчанию)
+  keybindings:
+    forward: "w"
+    backward: "s"
+    left: "a"
+    right: "d"
+    jump: "space"
+    sneak: "lshift"
+    sprint: "lcontrol"
+    inventory: "e"
+    chat: "t"
+    drop: "q"
+    swap_item: "f"
+    hotbar_1: "1"
+    hotbar_2: "2"
+    hotbar_3: "3"
+    hotbar_4: "4"
+    hotbar_5: "5"
+    hotbar_6: "6"
+    hotbar_7: "7"
+    hotbar_8: "8"
+    hotbar_9: "9"
+    
+  # Настройки рутин
+  routines:
+    explore:
+      duration: 60  # секунд
+      avoid_water: true
+    mine_wood:
+      target_logs: 10
+    craft_table:
+      auto_place: true
+    eat:
+      hunger_threshold: 6  # когда есть (0-10)
+    sleep:
+      skip_night: true
+      
+  # OpenCV шаблоны (пути относительно plugins/minecraft/templates/)
+  templates:
+    health_bar: "health_bar.png"
+    hunger_bar: "hunger_bar.png"
+    hotbar: "hotbar.png"
+    inventory: "inventory.png"
+
+# Персона
+persona:
+  config_path: "persona/persona.yaml"
+  
+# Логирование
+logging:
+  level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+  jsonl_enabled: true
+  logs_dir: "data/logs"
+  max_log_size_mb: 100  # ротация логов
+  
+# Эволюция
+evolution:
+  enabled: true
+  improvements_dir: "data/improvements"
+  auto_apply: false  # не применять улучшения автоматически
+  min_confidence: 0.7  # минимальная уверенность для предложения улучшений
