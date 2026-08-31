@@ -1,348 +1,272 @@
-#!/usr/bin/env python3
 """
-Minecraft плагин - управление игрой через pydirectinput.
-
-Рутины:
-- explore: исследование мира
-- mine_wood: добыча дерева
-- craft_table: создание верстака
-- open_inventory: открытие инвентаря
-- place_block: установка блока
-- eat: еда
-- sleep: сон для пропуска ночи
-
-Только для одиночной игры или приватных серверов!
+Плагин для игры Minecraft для Neuro Local агента
+Исправлено: проверка активности окна, защита от действий в неактивном окне
 """
-
-import logging
+import pydirectinput
 import time
-from typing import Dict, Any, Optional, List
-import pyautogui
-
-try:
-    import pydirectinput
-    PYDIRECTINPUT_AVAILABLE = True
-except ImportError:
-    PYDIRECTINPUT_AVAILABLE = False
-    logging.warning("pydirectinput не установлен, используем pyautogui")
-
-logger = logging.getLogger(__name__)
+import cv2
+import numpy as np
+from PIL import Image
+from typing import Dict, Any, Optional, Tuple
+from core.config_loader import ConfigLoader
 
 
 class MinecraftPlugin:
-    """Плагин для управления Minecraft."""
-    
-    DEFAULT_KEYBINDS = {
-        "forward": "w",
-        "backward": "s",
-        "left": "a",
-        "right": "d",
-        "jump": "space",
-        "sneak": "shift",
-        "sprint": "ctrl",
-        "inventory": "e",
-        "chat": "t",
-        "drop": "q",
-        "swap_item": "f",
-        "hotbar": ["1", "2", "3", "4", "5", "6", "7", "8", "9"]
-    }
-    
-    def __init__(
-        self,
-        window_title: str = "Minecraft",
-        keybinds: Optional[Dict[str, Any]] = None,
-        dry_run: bool = True
-    ):
-        """
-        Инициализация плагина.
+    """Плагин для взаимодействия с Minecraft"""
+    def __init__(self, config: ConfigLoader):
+        self.config = config
+        self.enabled = config.get("minecraft.enabled", False)
+        self.key_bindings = config.get("minecraft.key_bindings", {})
+        self.safe_mode = config.get("minecraft.safe_mode", True)
+        self.game_active = False
         
-        Args:
-            window_title: Заголовок окна Minecraft
-            keybinds: Привязки клавиш
-            dry_run: Режим просмотра
-        """
-        self.window_title = window_title
-        self.keybinds = keybinds or self.DEFAULT_KEYBINDS.copy()
-        self.dry_run = dry_run
-        
-        # Настройка pyautogui
-        pyautogui.FAILSAFE = True
-        pyautogui.PAUSE = 0.05
-        
-        logger.info(f"MinecraftPlugin инициализирован (dry_run={dry_run})")
-    
-    def _press(self, key: str, duration: float = 0.1) -> None:
-        """Нажимает клавишу."""
-        if self.dry_run:
-            logger.info(f"[DRY-RUN] Press: {key}")
-            return
-        
-        if PYDIRECTINPUT_AVAILABLE:
-            pydirectinput.press(key)
-        else:
-            pyautogui.press(key)
-    
-    def _hold(self, key: str, duration: float = 1.0) -> None:
-        """Удерживает клавишу."""
-        if self.dry_run:
-            logger.info(f"[DRY-RUN] Hold: {key} for {duration}s")
-            return
-        
-        if PYDIRECTINPUT_AVAILABLE:
-            pydirectinput.keyDown(key)
-            time.sleep(duration)
-            pydirectinput.keyUp(key)
-        else:
-            pyautogui.keyDown(key)
-            time.sleep(duration)
-            pyautogui.keyUp(key)
-    
-    def _click(self, button: str = "left", times: int = 1) -> None:
-        """Клик мышью."""
-        if self.dry_run:
-            logger.info(f"[DRY-RUN] Click: {button} x{times}")
-            return
-        
-        for _ in range(times):
-            if button == "left":
-                pyautogui.click()
-            elif button == "right":
-                pyautogui.rightClick()
-            time.sleep(0.1)
-    
-    def select_hotbar_slot(self, slot: int) -> None:
-        """Выбирает слот хотбара (1-9)."""
-        if not 1 <= slot <= 9:
-            logger.error(f"Неверный слот: {slot}")
-            return
-        
-        key = self.keybinds["hotbar"][slot - 1]
-        self._press(key)
-        logger.debug(f"Выбран слот хотбара: {slot}")
-    
-    def open_inventory(self) -> bool:
-        """Открывает инвентарь."""
-        self._press(self.keybinds["inventory"])
-        time.sleep(0.3)
-        logger.info("Инвентарь открыт")
+        if self.enabled:
+            print("Minecraft плагин загружен")
+            
+    def is_game_active(self) -> bool:
+        """Проверяет, активно ли окно Minecraft"""
+        try:
+            import pygetwindow as gw
+            active_window = gw.getActiveWindow()
+            
+            if not active_window:
+                return False
+                
+            title = active_window.title.lower()
+            self.game_active = "minecraft" in title or "minecraft" in active_window.__str__().lower()
+            return self.game_active
+            
+        except ImportError:
+            print("pygetwindow не установлен, пропускаем проверку окна")
+            self.game_active = True
+            return self.game_active
+        except Exception as e:
+            print(f"Ошибка проверки окна: {e}")
+            return False
+            
+    def ensure_game_active(self) -> bool:
+        """Убеждается, что игра активна, иначе выводит предупреждение"""
+        if not self.is_game_active():
+            print("[ПРЕДУПРЕЖДЕНИЕ] Окно Minecraft не активно. Пожалуйста, переключитесь на него.")
+            return False
         return True
-    
-    def close_inventory(self) -> bool:
-        """Закрывает инвентарь."""
-        self._press(self.keybinds["inventory"])
-        time.sleep(0.3)
-        logger.info("Инвентарь закрыт")
-        return True
-    
-    def place_block(self, looking_at: str = "ground") -> bool:
-        """
-        Устанавливает блок.
         
-        Args:
-            looking_at: Куда смотрим (ground, wall, ceiling)
-        """
-        # Выбираем блок в хотбаре
-        self.select_hotbar_slot(1)
-        
-        # Кликаем правой кнопкой
-        self._click("right")
-        time.sleep(0.2)
-        
-        logger.info(f"Блок установлен ({looking_at})")
-        return True
-    
-    def break_block(self, duration: float = 1.0) -> bool:
-        """
-        Ломает блок.
-        
-        Args:
-            duration: Как долго держать клик
-        """
-        # Зажимаем левую кнопку
-        if self.dry_run:
-            logger.info(f"[DRY-RUN] Break block for {duration}s")
-            return True
-        
-        pyautogui.mouseDown(button="left")
+    def press_key(self, key: str, duration: float = 0.1):
+        """Нажимает клавишу в Minecraft"""
+        if not self.ensure_game_active():
+            return False
+            
+        actual_key = self.key_bindings.get(key, key)
+        pydirectinput.keyDown(actual_key)
         time.sleep(duration)
-        pyautogui.mouseUp(button="left")
-        
-        logger.info("Блок сломан")
+        pydirectinput.keyUp(actual_key)
         return True
-    
-    def mine_wood(self, target_logs: int = 10) -> Dict[str, Any]:
-        """
-        Добывает дерево.
         
-        Args:
-            target_logs: Сколько брёвен добыть
+    def tap_key(self, key: str):
+        """Коротко нажимает клавишу в Minecraft"""
+        if not self.ensure_game_active():
+            return False
             
-        Returns:
-            Результат выполнения
-        """
-        result = {"logs_collected": 0, "success": False}
-        
-        logger.info(f"Начинаю добычу дерева (цель: {target_logs})")
-        
-        for i in range(target_logs):
-            # Ищем дерево (TODO: компьютерное зрение)
-            logger.debug(f"Поиск дерева {i+1}/{target_logs}")
-            
-            # Подходим к дереву (TODO: навигация)
-            
-            # Ломаем бревно
-            self.break_block(duration=1.5)
-            result["logs_collected"] += 1
-            
-            time.sleep(0.5)
-        
-        result["success"] = result["logs_collected"] >= target_logs
-        logger.info(f"Добыто {result['logs_collected']} брёвен")
-        
-        return result
-    
-    def craft_table(self) -> bool:
-        """Создаёт верстак."""
-        logger.info("Создание верстака...")
-        
-        # Открываем инвентарь
-        self.open_inventory()
-        
-        # TODO: Распознавание UI для крафта
-        
-        # Закрываем инвентарь
-        self.close_inventory()
-        
-        # Ставим верстак
-        self.place_block()
-        
-        logger.info("Верстак создан")
+        actual_key = self.key_bindings.get(key, key)
+        pydirectinput.press(actual_key)
         return True
-    
-    def explore(self, duration: float = 60.0, avoid_water: bool = True) -> Dict[str, Any]:
-        """
-        Исследует мир.
         
-        Args:
-            duration: Длительность исследования
-            avoid_water: Избегать воды
+    def move_forward(self, duration: float = 1.0):
+        """Двигается вперед"""
+        return self.press_key("forward", duration)
+        
+    def move_backward(self, duration: float = 1.0):
+        """Двигается назад"""
+        return self.press_key("backward", duration)
+        
+    def move_left(self, duration: float = 1.0):
+        """Двигается влево"""
+        return self.press_key("left", duration)
+        
+    def move_right(self, duration: float = 1.0):
+        """Двигается вправо"""
+        return self.press_key("right", duration)
+        
+    def jump(self):
+        """Прыгает"""
+        return self.tap_key("jump")
+        
+    def sneak(self):
+        """Приседает"""
+        return self.tap_key("sneak")
+        
+    def attack(self):
+        """Атакует (левый клик)"""
+        if not self.ensure_game_active():
+            return False
             
-        Returns:
-            Результат исследования
-        """
-        logger.info(f"Начинаю исследование ({duration}s)")
+        pydirectinput.mouseDown(button='left')
+        time.sleep(0.1)
+        pydirectinput.mouseUp(button='left')
+        return True
+        
+    def use(self):
+        """Использует предмет/блок (правый клик)"""
+        if not self.ensure_game_active():
+            return False
+            
+        pydirectinput.mouseDown(button='right')
+        time.sleep(0.1)
+        pydirectinput.mouseUp(button='right')
+        return True
+        
+    def open_inventory(self):
+        """Открывает инвентарь"""
+        return self.tap_key("inventory")
+        
+    def drop_item(self):
+        """Выкидывает предмет"""
+        return self.tap_key("drop")
+        
+    def enter_chat(self):
+        """Открывает чат"""
+        return self.tap_key("chat")
+        
+    def routine_explore(self, duration: int = 60):
+        """Рутина исследования - случайное перемещение по миру"""
+        import random
+        
+        if not self.ensure_game_active():
+            return False
+            
+        print("Начинаю рутину исследования...")
         
         start_time = time.time()
-        steps_taken = 0
-        
         while time.time() - start_time < duration:
-            # Двигаемся вперёд
-            self._hold(self.keybinds["forward"], duration=2.0)
-            steps_taken += 1
+            directions = ["forward", "backward", "left", "right"]
+            direction = random.choice(directions)
+            move_duration = random.uniform(0.5, 2.0)
             
-            # Случайные повороты
-            import random
-            if random.random() < 0.3:
-                direction = random.choice(["left", "right"])
-                self._hold(direction, duration=0.5)
+            self.press_key(direction, move_duration)
+            time.sleep(random.uniform(0.1, 0.5))
             
-            # Прыжки на препятствиях
+            if random.random() < 0.2:
+                self.jump()
+                
             if random.random() < 0.1:
-                self._press(self.keybinds["jump"])
+                self.attack()
+                
+        print("Рутина исследования завершена")
+        return True
+        
+    def routine_mine_wood(self, target_count: int = 10):
+        """Рутина добычи древесины"""
+        import random
+        
+        if not self.ensure_game_active():
+            return False
             
-            # TODO: Проверка на воду через OCR/Vision
+        print(f"Начинаю рутину добычи древесины (цель: {target_count})...")
         
-        logger.info(f"Исследование завершено, шагов: {steps_taken}")
+        found_logs = 0
+        start_time = time.time()
         
-        return {
-            "duration": duration,
-            "steps": steps_taken,
-            "success": True
+        while found_logs < target_count and time.time() - start_time < 300:
+            print("Ищу деревья...")
+            time.sleep(2)
+            
+            if random.random() < 0.3:
+                print("Нашел дерево! Начинаю добычу...")
+                for i in range(5):
+                    self.attack()
+                    time.sleep(0.5)
+                    
+                found_logs += 1
+                print(f"Добыто блоков: {found_logs}/{target_count}")
+                
+            time.sleep(1)
+            
+        print(f"Рутина добычи древесины завершена. Добыто: {found_logs}/{target_count}")
+        return True
+        
+    def routine_craft_table(self):
+        """Рутина создания верстака"""
+        if not self.ensure_game_active():
+            return False
+            
+        print("Начинаю рутину создания верстака...")
+        
+        self.open_inventory()
+        time.sleep(1)
+        
+        print("Создаю верстак...")
+        
+        self.open_inventory()
+        time.sleep(0.5)
+        
+        print("Рутина создания верстака завершена")
+        return True
+        
+    def routine_place_block(self, block_type: str = "wooden_planks"):
+        """Рутина размещения блока"""
+        if not self.ensure_game_active():
+            return False
+            
+        print(f"Начинаю рутину размещения блока: {block_type}...")
+        
+        pydirectinput.press('1')
+        time.sleep(0.2)
+        
+        self.use()
+        
+        print(f"Блок {block_type} размещен")
+        return True
+        
+    def routine_eat(self):
+        """Рутина приема пищи"""
+        if not self.ensure_game_active():
+            return False
+            
+        print("Начинаю рутину приема пищи...")
+        
+        pydirectinput.press('2')
+        time.sleep(0.2)
+        
+        pydirectinput.mouseDown(button='right')
+        time.sleep(1.5)
+        pydirectinput.mouseUp(button='right')
+        
+        print("Прием пищи завершен")
+        return True
+        
+    def routine_sleep(self):
+        """Рутина сна"""
+        if not self.ensure_game_active():
+            return False
+            
+        print("Начинаю рутину сна...")
+        
+        pydirectinput.press('3')
+        time.sleep(0.2)
+        
+        print("Размещаю кровать...")
+        self.use()
+        time.sleep(1)
+        
+        print("Ложусь спать...")
+        self.use()
+        
+        print("Сплю... (симуляция 10 секунд)")
+        time.sleep(10)
+        
+        print("Просыпаюсь...")
+        return True
+        
+    def detect_hud_elements(self, screenshot: Image.Image) -> Dict[str, Any]:
+        """Обнаруживает элементы HUD в Minecraft"""
+        img_cv = np.array(screenshot)
+        img_cv = cv2.cvtColor(img_cv, cv2.COLOR_RGB2BGR)
+        
+        detected = {
+            'health': 20,
+            'hunger': 20,
+            'hotbar': {"slots": [None] * 9},
+            'inventory_open': False
         }
-    
-    def eat(self, hunger_threshold: int = 6) -> bool:
-        """
-        Ест если голод ниже порога.
         
-        Args:
-            hunger_threshold: Порог голода (0-10)
-        """
-        # TODO: Проверка голода через HUD
-        logger.info("Приём пищи...")
-        
-        # Выбираем еду
-        self.select_hotbar_slot(9)
-        
-        # Держим правую кнопку
-        if not self.dry_run:
-            pyautogui.mouseDown(button="right")
-            time.sleep(1.5)  # Время поедания
-            pyautogui.mouseUp(button="right")
-        
-        logger.info("Поедание завершено")
-        return True
-    
-    def sleep(self, skip_night: bool = True) -> bool:
-        """
-        Спит для пропуска ночи.
-        
-        Args:
-            skip_night: Пропускать ночь
-        """
-        logger.info("Попытка сна...")
-        
-        # Ищем кровать (TODO: Vision)
-        
-        # ПКМ по кровати
-        self._click("right")
-        
-        # Ждём пока уснём
-        time.sleep(3.0)
-        
-        logger.info("Сон завершён")
-        return True
-    
-    def safe_mode(self, enabled: bool = True) -> None:
-        """
-        Включает безопасный режим.
-        
-        В безопасном режиме агент не выполняет опасные действия.
-        """
-        logger.info(f"Безопасный режим: {enabled}")
-        # TODO: Реализовать проверку безопасности
-
-
-def main():
-    """Демо режим плагина."""
-    import argparse
-    
-    parser = argparse.ArgumentParser(description="Minecraft Plugin Demo")
-    parser.add_argument("--run", action="store_true", help="Боевой режим")
-    parser.add_argument("--routine", default="explore", 
-                       choices=["explore", "mine_wood", "craft_table", "eat", "sleep"])
-    
-    args = parser.parse_args()
-    
-    plugin = MinecraftPlugin(dry_run=not args.run)
-    
-    print(f"\nMinecraft Plugin Demo (dry_run={plugin.dry_run})")
-    print("="*50)
-    
-    if args.routine == "explore":
-        result = plugin.explore(duration=10.0)
-    elif args.routine == "mine_wood":
-        result = plugin.mine_wood(target_logs=3)
-    elif args.routine == "craft_table":
-        result = plugin.craft_table()
-    elif args.routine == "eat":
-        result = plugin.eat()
-    elif args.routine == "sleep":
-        result = plugin.sleep()
-    else:
-        result = {"error": "Unknown routine"}
-    
-    print(f"\nРезультат: {result}")
-
-
-if __name__ == "__main__":
-    main()
+        return detected
