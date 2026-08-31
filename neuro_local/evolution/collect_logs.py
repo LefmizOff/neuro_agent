@@ -1,140 +1,75 @@
-#!/usr/bin/env python3
 """
-Сбор логов сессий для анализа.
-
-Использование:
-    python evolution/collect_logs.py --session 2024-01-15
+Сбор логов для анализа эволюции
 """
-
 import json
-import logging
-from typing import List, Dict, Any, Optional
-from datetime import datetime
-from pathlib import Path
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+import os
+from typing import List, Dict, Any
+from datetime import datetime, timedelta
 
 
-class LogCollector:
-    """Сборщик логов сессий."""
+def collect_session_logs(logs_dir: str = "./data/logs", hours_back: int = 24) -> List[Dict[str, Any]]:
+    """Собирает логи за указанный период"""
+    logs = []
+    cutoff_time = datetime.now() - timedelta(hours=hours_back)
     
-    def __init__(self, logs_dir: str = "data/logs"):
-        self.logs_dir = Path(logs_dir)
-        self.logs_dir.mkdir(parents=True, exist_ok=True)
+    if not os.path.exists(logs_dir):
+        return logs
     
-    def collect_session(self, date: Optional[str] = None) -> List[Dict[str, Any]]:
-        """
-        Собирает логи за указанную дату.
-        
-        Args:
-            date: Дата в формате YYYY-MM-DD (по умолчанию сегодня)
+    for filename in os.listdir(logs_dir):
+        if not (filename.endswith('.jsonl') or filename.endswith('.log')):
+            continue
             
-        Returns:
-            Список записей логов
-        """
-        if date is None:
-            date = datetime.now().strftime("%Y-%m-%d")
+        filepath = os.path.join(logs_dir, filename)
         
-        log_file = self.logs_dir / f"session_{date}.jsonl"
-        
-        if not log_file.exists():
-            logger.warning(f"Лог файл не найден: {log_file}")
-            return []
-        
-        entries = []
-        with open(log_file, 'r', encoding='utf-8') as f:
-            for line in f:
-                try:
-                    entry = json.loads(line.strip())
-                    entries.append(entry)
-                except json.JSONDecodeError:
-                    continue
-        
-        logger.info(f"Собрано {len(entries)} записей за {date}")
-        return entries
+        try:
+            mod_time = datetime.fromtimestamp(os.path.getmtime(filepath))
+            if mod_time < cutoff_time:
+                continue
+                
+            with open(filepath, 'r', encoding='utf-8') as file:
+                for line in file:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entry = json.loads(line)
+                        if 'timestamp' in entry:
+                            entry_time = datetime.fromisoformat(entry['timestamp'])
+                            if entry_time >= cutoff_time:
+                                logs.append(entry)
+                        else:
+                            logs.append(entry)
+                    except json.JSONDecodeError:
+                        continue
+        except Exception:
+            continue
     
-    def get_summary(self, entries: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """
-        Создаёт сводку по логам.
-        
-        Args:
-            entries: Список записей логов
-            
-        Returns:
-            Словарь сводки
-        """
-        if not entries:
-            return {"total": 0}
-        
-        actions = {}
-        errors = []
-        
-        for entry in entries:
-            action_type = entry.get("action", {}).get("action", {}).get("action_type", "unknown")
-            actions[action_type] = actions.get(action_type, 0) + 1
-            
-            if entry.get("error"):
-                errors.append(entry["error"])
-        
-        return {
-            "total": len(entries),
-            "actions": actions,
-            "errors_count": len(errors),
-            "success_rate": (len(entries) - len(errors)) / len(entries) if entries else 0
-        }
-    
-    def export_for_analysis(self, date: Optional[str] = None) -> str:
-        """
-        Экспортирует логи в формат для анализа LLM.
-        
-        Returns:
-            Текст для отправки в LLM
-        """
-        entries = self.collect_session(date)
-        summary = self.get_summary(entries)
-        
-        lines = [
-            "=== АНАЛИЗ СЕССИИ ===",
-            f"Дата: {date or 'сегодня'}",
-            f"Всего действий: {summary['total']}",
-            f"Успешность: {summary.get('success_rate', 0):.1%}",
-            "",
-            "Распределение действий:"
-        ]
-        
-        for action, count in summary.get("actions", {}).items():
-            lines.append(f"  {action}: {count}")
-        
-        if summary.get("errors_count", 0) > 0:
-            lines.append("")
-            lines.append("Ошибки:")
-            for i, err in enumerate(entries[:10]):  # Первые 10 ошибок
-                if err.get("error"):
-                    lines.append(f"  {i+1}. {err['error']}")
-        
-        return "\n".join(lines)
+    logs.sort(key=lambda x: x.get('timestamp', ''))
+    return logs
 
 
-def main():
-    import argparse
+def collect_recent_sessions(logs_dir: str = "./data/logs", days_back: int = 7) -> List[List[Dict[str, Any]]]:
+    """Группирует логи по сессиям"""
+    all_logs = collect_session_logs(logs_dir, hours_back=days_back*24)
     
-    parser = argparse.ArgumentParser(description="Сбор логов сессии")
-    parser.add_argument("--session", help="Дата сессии (YYYY-MM-DD)")
-    parser.add_argument("--export", action="store_true", help="Экспортировать для анализа")
+    sessions = []
+    current_session = []
     
-    args = parser.parse_args()
+    for entry in all_logs:
+        if current_session:
+            try:
+                prev_time = datetime.fromisoformat(current_session[-1]['timestamp'])
+                curr_time = datetime.fromisoformat(entry['timestamp']) if 'timestamp' in entry else datetime.now()
+                
+                if (curr_time - prev_time).total_seconds() > 1800:  # 30 минут
+                    sessions.append(current_session)
+                    current_session = []
+            except:
+                pass
+        
+        current_session.append(entry)
     
-    collector = LogCollector()
+    if current_session:
+        sessions.append(current_session)
     
-    if args.export:
-        text = collector.export_for_analysis(args.session)
-        print(text)
-    else:
-        entries = collector.collect_session(args.session)
-        summary = collector.get_summary(entries)
-        print(json.dumps(summary, indent=2, ensure_ascii=False))
-
-
-if __name__ == "__main__":
-    main()
+    return sessions
