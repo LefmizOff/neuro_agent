@@ -1,53 +1,32 @@
 """
-Core module - ядро системы Neuro Local Agent.
-
-Содержит:
-- Ollama клиент для работы с локальными моделями
-- Планировщик задач
-- Шина событий
-- Схема действий (Pydantic)
-- Менеджер безопасности
+Модуль ядра системы Neuro Local
+Содержит основные компоненты: Ollama-клиент, планировщик, шину событий, безопасность, схемы действий
 """
-
-from .ollama_client import OllamaClient, VisionModel, LLMModel
-from .actions_schema import ActionSchema, ActionType, ClickAction, MoveAction, TypeAction, PressKeyAction, HotkeyAction, WaitAction, ScrollAction, LaunchAppAction, CloseWindowAction, DragAction
-from .planner import Planner
-from .event_bus import EventBus, Event, EventType
-from .safety_manager import SafetyManager, DangerLevel
-from .config_loader import ConfigLoader
+from core.ollama_client import OllamaClient
+from core.config_loader import ConfigLoader
+from core.event_bus import EventBus
+from core.planner import Planner
+from core.safety_manager import SafetyManager
+from core.actions_schema import (
+    Action, ActionType, Position,
+    MouseClickAction, MouseMoveAction,
+    KeyboardPressAction, KeyboardTypeAction,
+    RunApplicationAction, SleepAction
+)
 
 __all__ = [
-    # Ollama клиент
-    "OllamaClient",
-    "VisionModel",
-    "LLMModel",
-    
-    # Схема действий
-    "ActionSchema",
-    "ActionType",
-    "ClickAction",
-    "MoveAction",
-    "TypeAction",
-    "PressKeyAction",
-    "HotkeyAction",
-    "WaitAction",
-    "ScrollAction",
-    "LaunchAppAction",
-    "CloseWindowAction",
-    "DragAction",
-    
-    # Планировщик
-    "Planner",
-    
-    # Шина событий
-    "EventBus",
-    "Event",
-    "EventType",
-    
-    # Безопасность
-    "SafetyManager",
-    "DangerLevel",
-    
-    # Конфигурация
-    "ConfigLoader",
+    'OllamaClient',
+    'ConfigLoader',
+    'EventBus',
+    'Planner',
+    'SafetyManager',
+    'Action',
+    'ActionType',
+    'Position',
+    'MouseClickAction',
+    'MouseMoveAction',
+    'KeyboardPressAction',
+    'KeyboardTypeAction',
+    'RunApplicationAction',
+    'SleepAction'
 ]

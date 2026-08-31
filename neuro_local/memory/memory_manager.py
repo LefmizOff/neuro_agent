@@ -1,213 +1,120 @@
 """
-Менеджер памяти с LLM-reranker.
-
-Использует текстовый поиск + qwen2.5:7b-instruct для reranking.
+Менеджер памяти с LLM-переоценкой релевантности
 """
-
-import logging
 from typing import List, Dict, Any, Optional
-from datetime import datetime
-
-from .sqlite_storage import SQLiteStorage
 from core.ollama_client import OllamaClient
-
-logger = logging.getLogger(__name__)
+from core.config_loader import ConfigLoader
+from memory.sqlite_storage import SQLiteStorage
 
 
 class MemoryManager:
-    """
-    Менеджер памяти с LLM-reranker.
+    """Менеджер памяти с поиском и LLM-reranking"""
     
-    Алгоритм поиска:
-    1. Текстовый поиск по ключевым словам (LIKE %query%)
-    2. Получение топ-k кандидатов
-    3. LLM-reranker выбирает наиболее релевантные
-    """
-    
-    def __init__(
-        self,
-        storage: SQLiteStorage,
-        ollama_client: OllamaClient,
-        rerank_top_k: int = 5
-    ):
-        """
-        Инициализация менеджера памяти.
+    def __init__(self, ollama_client: OllamaClient, config: ConfigLoader):
+        self.ollama_client = ollama_client
+        self.config = config
+        self.storage = SQLiteStorage(config.get("memory.db_path", "./data/memory.db"))
+        self.text_model = config.get("ollama.text_model", "qwen2.5:7b-instruct")
         
-        Args:
-            storage: SQLite хранилище
-            ollama_client: Клиент Ollama для reranking
-            rerank_top_k: Сколько кандидатов передавать reranker'у
-        """
-        self.storage = storage
-        self.client = ollama_client
-        self.rerank_top_k = rerank_top_k
+    def save_episode(self, goal: str, perception: Dict[str, Any], plan: Dict[str, Any], 
+                     action: Dict[str, Any], result: Dict[str, Any], error: Optional[str] = None):
+        """Сохраняет эпизод"""
+        self.storage.save_episode(goal, perception, plan, action, result, error)
         
-        logger.info(f"MemoryManager инициализирован (rerank_top_k={rerank_top_k})")
-    
-    # === Поиск с reranking ===
-    
-    def search_memories(
-        self,
-        query: str,
-        memory_type: str = "all",
-        limit: int = 3
-    ) -> List[Dict[str, Any]]:
-        """
-        Ищет воспоминания с LLM-reranking.
+    def save_fact(self, category: str, content: str, importance: float = 0.5):
+        """Сохраняет факт"""
+        self.storage.save_fact(category, content, importance)
         
-        Args:
-            query: Поисковый запрос
-            memory_type: Тип памяти ("episodes", "facts", "skills", "all")
-            limit: Сколько результатов вернуть
-            
-        Returns:
-            Список релевантных воспоминаний
-        """
-        candidates = []
+    def save_skill(self, name: str, description: str, steps: List[Dict[str, Any]], 
+                   success_rate: float = 0.0):
+        """Сохраняет навык"""
+        self.storage.save_skill(name, description, steps, success_rate)
         
-        # Собираем кандидатов из разных источников
-        if memory_type in ["episodes", "all"]:
-            episodes = self.storage.search_episodes(query, limit=self.rerank_top_k)
-            for ep in episodes:
-                candidates.append({
-                    "type": "episode",
-                    "content": f"Goal: {ep.get('goal', '')}; Result: {ep.get('result', '')}",
-                    "data": ep
-                })
+    def save_error(self, error_type: str, error_message: str, context: Dict[str, Any], 
+                   solution: Optional[str] = None):
+        """Сохраняет ошибку"""
+        self.storage.save_error(error_type, error_message, context, solution)
         
-        if memory_type in ["facts", "all"]:
-            facts = self.storage.search_facts(query, limit=self.rerank_top_k)
-            for fact in facts:
-                candidates.append({
-                    "type": "fact",
-                    "content": f"{fact.get('key', '')}: {fact.get('value', '')}",
-                    "data": fact
-                })
-        
-        if not candidates:
+    def retrieve_relevant_memories(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
+        """Извлекает релевантные воспоминания с LLM-переоценкой"""
+        if not query:
             return []
         
-        # Если кандидатов мало или не нужен reranking
-        if len(candidates) <= limit:
-            return [c["data"] for c in candidates]
+        # Грубый поиск по ключевым словам
+        raw_results = []
         
-        # LLM-reranking
-        reranked = self._rerank_candidates(query, candidates, limit)
-        return reranked
-    
-    def _rerank_candidates(
-        self,
-        query: str,
-        candidates: List[Dict[str, Any]],
-        limit: int
-    ) -> List[Dict[str, Any]]:
-        """
-        Использует LLM для выбора наиболее релевантных кандидатов.
+        episodes = self.storage.search_episodes(query, limit=10)
+        for ep in episodes:
+            raw_results.append({
+                "type": "episode",
+                "content": f"Goal: {ep.get('goal', '')}, Action: {str(ep.get('action', ''))[:100]}",
+                "original": ep
+            })
         
-        Args:
-            query: Поисковый запрос
-            candidates: Список кандидатов
-            limit: Сколько лучших вернуть
-            
-        Returns:
-            Список отранжированных кандидатов
-        """
-        # Формируем промпт для reranking
-        candidates_text = "\n\n".join([
-            f"[{i}] {c['type']}: {c['content']}"
-            for i, c in enumerate(candidates, 1)
+        facts = self.storage.search_facts(query, limit=10)
+        for fact in facts:
+            raw_results.append({
+                "type": "fact", 
+                "content": fact.get('content', ''),
+                "original": fact
+            })
+        
+        skills = self.storage.search_skills(query, limit=10)
+        for skill in skills:
+            raw_results.append({
+                "type": "skill",
+                "content": f"Skill: {skill.get('name', '')}, {skill.get('description', '')}",
+                "original": skill
+            })
+        
+        if not raw_results:
+            return []
+        
+        # LLM-переоценка
+        reranked = self._rerank_with_llm(query, raw_results)
+        return reranked[:top_k]
+        
+    def _rerank_with_llm(self, query: str, candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Переоченивает релевантность через LLM"""
+        if len(candidates) <= 1:
+            return candidates
+        
+        candidates_text = "\n".join([
+            f"{i+1}. {c['content']}" for i, c in enumerate(candidates)
         ])
         
-        prompt = f"""Ты — система ранжирования воспоминаний.
-
-Поисковый запрос: "{query}"
+        prompt = f"""Запрос: {query}
 
 Кандидаты:
 {candidates_text}
 
-Выбери топ-{limit} наиболее релевантных воспоминаний для этого запроса.
-Верни только номера через запятую (например: 1, 3, 2)."""
-
+Верни номера наиболее релевантных в порядке убывания (JSON массив): [1, 3, 2]"""
+        
         try:
-            response = self.client.chat(
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.1,  # Детерминированный выбор
-                max_tokens=100
+            response = self.ollama_client.chat(
+                model=self.text_model,
+                messages=[{"role": "user", "content": prompt}]
             )
             
-            # Парсим ответ - извлекаем номера
-            numbers = []
-            for char in response:
-                if char.isdigit():
-                    numbers.append(int(char))
-            
-            # Возвращаем в порядке релевантности
-            result = []
-            for num in numbers:
-                idx = num - 1
-                if 0 <= idx < len(candidates):
-                    result.append(candidates[idx]["data"])
-                    if len(result) >= limit:
-                        break
-            
-            return result if result else [candidates[0]["data"]]
-            
+            import json, re
+            json_match = re.search(r'\[(.*?)\]', response)
+            if json_match:
+                indices = json.loads(f"[{json_match.group(1)}]")
+                ranked = []
+                for idx in indices:
+                    if 0 < idx <= len(candidates):
+                        ranked.append(candidates[idx-1])
+                return ranked
         except Exception as e:
-            logger.error(f"Ошибка LLM-reranking: {e}")
-            # Fallback: возвращаем первых по порядку
-            return [c["data"] for c in candidates[:limit]]
-    
-    # === Добавление воспоминаний ===
-    
-    def store_episode(
-        self,
-        goal: str,
-        perception: Dict[str, Any],
-        action: Dict[str, Any],
-        result: Optional[str] = None,
-        error: Optional[str] = None
-    ) -> int:
-        """Сохраняет эпизод."""
-        return self.storage.add_episode(goal, perception, action, result, error)
-    
-    def store_fact(
-        self,
-        category: str,
-        key: str,
-        value: str,
-        confidence: float = 1.0
-    ) -> None:
-        """Сохраняет факт."""
-        self.storage.add_fact(category, key, value, confidence)
-    
-    def store_skill(
-        self,
-        name: str,
-        description: str,
-        steps: List[Dict[str, Any]]
-    ) -> None:
-        """Сохраняет навык."""
-        self.storage.add_skill(name, description, steps)
-    
-    def store_error(
-        self,
-        error_type: str,
-        context: str,
-        solution: Optional[str] = None
-    ) -> None:
-        """Сохраняет ошибку."""
-        self.storage.add_error(error_type, context, solution)
-    
-    # === Получение ===
-    
-    def get_facts(self, category: Optional[str] = None) -> List[Dict[str, Any]]:
-        """Получает факты."""
-        return self.storage.get_facts(category)
-    
-    def get_skills(self) -> List[Dict[str, Any]]:
-        """Получает навыки."""
-        return self.storage.get_skills()
-    
-    def close(self) -> None:
-        """Закрывает хранилище."""
-        self.storage.close()
+            print(f"[Memory] Ошибка rerank: {e}")
+        
+        return candidates
+        
+    def get_context_summary(self) -> Dict[str, Any]:
+        """Сводка по памяти"""
+        return {
+            "episodes_count": len(self.storage.get_recent_episodes(limit=1000)),
+            "facts_count": len(self.storage.get_all_facts()),
+            "skills_count": len(self.storage.get_all_skills()),
+            "recent_episodes": self.storage.get_recent_episodes(limit=5)
+        }

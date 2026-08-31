@@ -1,21 +1,9 @@
 """
-Perception module - восприятие агента.
-
-Содержит:
-- Скриншоты экрана
-- OCR (распознавание текста)
-- Поиск UI элементов
-- Set-of-Mark разметка
+Модуль восприятия для Neuro Local агента
 """
+from perception.screen_capture import ScreenCapture
+from perception.ocr_engine import OCREngine
+from perception.ui_detector import UIDetector
+from perception.set_of_mark import SetOfMark
 
-from .screen_capture import ScreenCapture
-from .ocr_engine import OCREngine
-from .ui_detector import UIDetector
-from .set_of_mark import SetOfMarker
-
-__all__ = [
-    "ScreenCapture",
-    "OCREngine",
-    "UIDetector",
-    "SetOfMarker",
-]
+__all__ = ['ScreenCapture', 'OCREngine', 'UIDetector', 'SetOfMark']

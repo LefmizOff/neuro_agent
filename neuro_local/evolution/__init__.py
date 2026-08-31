@@ -1,16 +1,7 @@
 """
-Evolution module - эволюция и улучшение агента.
-
-Содержит:
-- Сбор логов сессий
-- Анализ через qwen2.5:7b-instruct
-- Предложения улучшений
+Модуль эволюции для Neuro Local агента
 """
+from evolution.collect_logs import collect_session_logs, collect_recent_sessions
+from evolution.improve import EvolutionAnalyzer
 
-from .collect_logs import LogCollector
-from .improve import ImprovementAnalyzer
-
-__all__ = [
-    "LogCollector",
-    "ImprovementAnalyzer",
-]
+__all__ = ['collect_session_logs', 'collect_recent_sessions', 'EvolutionAnalyzer']

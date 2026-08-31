@@ -1,74 +1,45 @@
 """
-Модуль захвата экрана для Neuro Local агента
-Исправлено: DPI awareness для Windows
+Захват скриншотов с учетом DPI
 """
 import mss
 from PIL import Image
-from typing import Tuple
 import sys
 
 
 class ScreenCapture:
-    """Класс для захвата скриншотов экрана"""
+    """Захват экрана с поддержкой DPI"""
+    
     def __init__(self):
         self.sct = mss.mss()
-        self._setup_dpi_awareness()
+        self._setup_dpi()
         
-    def _setup_dpi_awareness(self):
-        """Настраивает DPI awareness для корректных координат на Windows"""
+    def _setup_dpi(self):
+        """Настраивает DPI awareness для Windows"""
         if sys.platform == 'win32':
             try:
                 import ctypes
-                # PROCESS_PER_MONITOR_DPI_AWARE = 3
-                ctypes.windll.shcore.SetProcessDpiAwareness(3)
-            except Exception as e:
-                print(f"Warning: Не удалось настроить DPI awareness: {e}")
-        
+                ctypes.windll.shcore.SetProcessDpiAwareness(2)  # Per-monitor DPI
+            except Exception:
+                pass  # Игнорируем если не удалось
+                
     def take_screenshot(self) -> Image.Image:
-        """
-        Делает скриншот всего экрана
-        
-        Returns:
-            PIL Image объект скриншота
-        """
-        monitor = self.sct.monitors[1]
+        """Делает скриншот всего экрана"""
+        monitor = self.sct.monitors[1]  # Главный монитор
         sct_img = self.sct.grab(monitor)
         
+        # Конвертация в PIL Image
         img = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
         return img
         
-    def take_region_screenshot(self, region: Tuple[int, int, int, int]) -> Image.Image:
-        """
-        Делает скриншот определенной области экрана
-        
-        Args:
-            region: Кортеж (x, y, width, height) для области захвата
-            
-        Returns:
-            PIL Image объект скриншота
-        """
+    def take_region_screenshot(self, region: tuple) -> Image.Image:
+        """Скриншот области (x, y, width, height)"""
         x, y, width, height = region
         monitor = {"top": y, "left": x, "width": width, "height": height}
         sct_img = self.sct.grab(monitor)
-        
         img = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
         return img
         
-    def get_screen_size(self) -> Tuple[int, int]:
-        """
-        Возвращает размеры экрана
-        
-        Returns:
-            Кортеж (ширина, высота)
-        """
+    def get_screen_size(self) -> tuple:
+        """Возвращает размер экрана (width, height)"""
         monitor = self.sct.monitors[1]
         return monitor["width"], monitor["height"]
-        
-    def get_physical_screen_size(self) -> Tuple[int, int]:
-        """
-        Возвращает физические размеры экрана с учетом DPI
-        
-        Returns:
-            Кортеж (ширина, высота)
-        """
-        return self.get_screen_size()

@@ -1,16 +1,7 @@
 """
-Memory module - система памяти агента.
-
-Содержит:
-- SQLite хранилище для эпизодов, фактов, навыков, ошибок
-- Текстовый поиск по памяти
-- LLM-reranker через qwen2.5:7b-instruct
+Модуль памяти для Neuro Local агента
 """
+from memory.sqlite_storage import SQLiteStorage
+from memory.memory_manager import MemoryManager
 
-from .memory_manager import MemoryManager
-from .sqlite_storage import SQLiteStorage
-
-__all__ = [
-    "MemoryManager",
-    "SQLiteStorage",
-]
+__all__ = ['SQLiteStorage', 'MemoryManager']

@@ -1,360 +1,104 @@
 """
-Планировщик задач для агента.
-
-Использует LLM (qwen2.5:7b-instruct) для генерации планов действий.
+Планировщик действий для Neuro Local агента
+С надежным парсингом JSON из ответов модели
 """
-
-import logging
-from typing import List, Dict, Any, Optional
-from pydantic import BaseModel
-
-from .ollama_client import OllamaClient, LLMModel
-from .actions_schema import ActionSchema, ActionType
-
-logger = logging.getLogger(__name__)
-
-
-class PlanStep(BaseModel):
-    """Шаг плана."""
-    step_number: int
-    description: str
-    expected_outcome: str
-
-
-class Plan(BaseModel):
-    """План выполнения задачи."""
-    goal: str
-    steps: List[PlanStep]
-    current_step: int = 0
-    completed_steps: List[int] = []
-    
-    def next_step(self) -> Optional[PlanStep]:
-        """Возвращает следующий шаг."""
-        if self.current_step < len(self.steps):
-            return self.steps[self.current_step]
-        return None
-    
-    def mark_completed(self, step_number: int) -> None:
-        """Отмечает шаг как выполненный."""
-        if step_number not in self.completed_steps:
-            self.completed_steps.append(step_number)
-        self.current_step = max(self.completed_steps) + 1 if self.completed_steps else 0
-    
-    def is_complete(self) -> bool:
-        """Проверяет завершённость плана."""
-        return self.current_step >= len(self.steps)
+import json
+import re
+from typing import Dict, Any, List, Optional
+from core.ollama_client import OllamaClient
+from core.actions_schema import Action
+from core.config_loader import ConfigLoader
+from memory.memory_manager import MemoryManager
 
 
 class Planner:
-    """
-    Планировщик задач на основе LLM.
+    """Планировщик действий с устойчивым парсингом JSON"""
     
-    Генерирует пошаговые планы и определяет следующее действие.
-    """
+    SYSTEM_PROMPT = """
+Ты - планировщик действий для локального ИИ-агента. 
+Отвечай ТОЛЬКО в формате JSON без markdown и лишних слов.
+Доступные действия: mouse_click, mouse_move, keyboard_press, keyboard_type, run_application, sleep.
+Если действие определить невозможно, верни null.
+"""
     
-    SYSTEM_PROMPT = """Ты — планировщик задач локального ИИ-агента Neuro.
-Твоя задача — разбивать сложные цели на простые шаги и определять конкретные действия.
-
-Важные правила:
-1. Всегда действуй безопасно — не предлагай опасных действий без подтверждения
-2. Учитывай контекст: активное окно, позицию мыши, видимые элементы
-3. Если не уверен — предложи подождать или запросить уточнение
-4. Используй память о предыдущих успехах и ошибках
-5. Действия должны быть конкретными и выполнимыми
-
-Формат ответа:
-1. Краткий анализ ситуации
-2. План шагов (если задача сложная)
-3. Конкретное следующее действие в JSON формате
-
-Доступные типы действий:
-- click: клик мышью по координатам
-- double_click: двойной клик
-- right_click: правый клик
-- move: перемещение мыши
-- drag: перетаскивание
-- type: ввод текста
-- press_key: нажатие клавиши
-- hotkey: комбинация клавиш (например, ctrl+c)
-- wait: ожидание
-- scroll: прокрутка
-- launch_app: запуск приложения
-- close_window: закрытие окна
-- speak: произнесение текста
-- none: бездействие (ожидание)
-
-ВАЖНО: Ответ должен содержать JSON объекта с полем "action", который соответствует схеме ActionSchema."""
-
-    def __init__(self, ollama_client: OllamaClient):
-        """
-        Инициализация планировщика.
+    def __init__(self, ollama_client: OllamaClient, config: ConfigLoader, memory_manager: MemoryManager):
+        self.ollama_client = ollama_client
+        self.config = config
+        self.memory_manager = memory_manager
+        self.text_model = config.get("ollama.text_model", "qwen2.5:7b-instruct")
         
-        Args:
-            ollama_client: Клиент Ollama для работы с LLM
-        """
-        self.client = ollama_client
-        self.current_plan: Optional[Plan] = None
-        self.action_history: List[Dict[str, Any]] = []
-        
-        logger.info("Planner инициализирован")
-    
-    def create_plan(
+    def plan_next_action(
         self,
         goal: str,
-        context: Dict[str, Any],
-        memories: Optional[List[str]] = None
-    ) -> Plan:
-        """
-        Создаёт план выполнения задачи.
+        current_state: Dict[str, Any],
+        relevant_memories: Optional[List[Dict[str, Any]]] = None
+    ) -> Optional[Action]:
+        """Планирует следующее действие"""
+        if not goal:
+            print("[Planner] Пустая цель")
+            return None
         
-        Args:
-            goal: Цель задачи
-            context: Контекст (окно, скриншот описание, последние действия)
-            memories: Релевантные воспоминания из памяти
-            
-        Returns:
-            План выполнения
-        """
-        prompt = self._build_plan_prompt(goal, context, memories)
-        
-        try:
-            response = self.client.chat(
-                messages=[
-                    {"role": "system", "content": self.SYSTEM_PROMPT},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.5,
-                max_tokens=2048
-            )
-            
-            # Парсим ответ для извлечения шагов
-            steps = self._parse_plan_steps(response, goal)
-            
-            self.current_plan = Plan(goal=goal, steps=steps)
-            logger.info(f"Создан план: {len(steps)} шагов для цели '{goal}'")
-            
-            return self.current_plan
-            
-        except Exception as e:
-            logger.error(f"Ошибка создания плана: {e}")
-            # Возвращаем минимальный план
-            return Plan(
-                goal=goal,
-                steps=[PlanStep(step_number=1, description="Выполнить задачу", expected_outcome="Задача выполнена")]
-            )
-    
-    def get_next_action(
-        self,
-        goal: str,
-        perception: Dict[str, Any],
-        memories: Optional[List[str]] = None
-    ) -> ActionSchema:
-        """
-        Определяет следующее действие на основе текущего состояния.
-        
-        Args:
-            goal: Текущая цель
-            perception: Данные восприятия (скриншот, OCR, UI элементы)
-            memories: Релевантные воспоминания
-            
-        Returns:
-            Следующее действие
-        """
-        prompt = self._build_action_prompt(goal, perception, memories)
-        
-        try:
-            response = self.client.chat(
-                messages=[
-                    {"role": "system", "content": self.SYSTEM_PROMPT},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.3,  # Более детерминированный выбор
-                max_tokens=1024
-            )
-            
-            # Извлекаем JSON действия из ответа
-            action = self._parse_action(response)
-            
-            # Сохраняем в историю
-            self.action_history.append({
-                "goal": goal,
-                "perception_summary": str(perception)[:200],
-                "action": action.to_dict()
-            })
-            
-            return action
-            
-        except Exception as e:
-            logger.error(f"Ошибка определения действия: {e}")
-            # Возвращаем безопасное действие ожидания
-            from .actions_schema import WaitAction, ActionSchema
-            return ActionSchema(
-                action=WaitAction(seconds=2.0, reason=f"Ошибка планирования: {e}")
-            )
-    
-    def _build_plan_prompt(
-        self,
-        goal: str,
-        context: Dict[str, Any],
-        memories: Optional[List[str]] = None
-    ) -> str:
-        """Строит промпт для создания плана."""
-        parts = [f"Цель: {goal}\n"]
-        
-        if context.get("active_window"):
-            parts.append(f"Активное окно: {context['active_window']}\n")
-        
-        if context.get("description"):
-            parts.append(f"Описание экрана: {context['description']}\n")
-        
-        if context.get("last_actions"):
-            parts.append("Последние действия:\n")
-            for i, action in enumerate(context["last_actions"][-5:], 1):
-                parts.append(f"  {i}. {action}\n")
-        
-        if memories:
-            parts.append("\nРелевантные воспоминания:\n")
-            for mem in memories[:3]:
-                parts.append(f"  - {mem}\n")
-        
-        parts.append("\nСоздай пошаговый план выполнения задачи.")
-        
-        return "".join(parts)
-    
-    def _build_action_prompt(
-        self,
-        goal: str,
-        perception: Dict[str, Any],
-        memories: Optional[List[str]] = None
-    ) -> str:
-        """Строит промпт для определения следующего действия."""
-        parts = [f"Цель: {goal}\n\n"]
-        
-        # Информация о восприятии
-        parts.append("Текущее состояние:\n")
-        
-        if perception.get("active_window"):
-            parts.append(f"- Активное окно: {perception['active_window']}\n")
-        
-        if perception.get("mouse_position"):
-            pos = perception["mouse_position"]
-            parts.append(f"- Позиция мыши: ({pos['x']}, {pos['y']})\n")
-        
-        if perception.get("screen_description"):
-            parts.append(f"- Описание экрана: {perception['screen_description']}\n")
-        
-        if perception.get("ocr_text"):
-            text = perception["ocr_text"][:500]
-            parts.append(f"- Найденный текст: {text}...\n")
-        
-        if perception.get("ui_elements"):
-            elements = perception["ui_elements"][:5]
-            parts.append(f"- UI элементы: {elements}\n")
-        
-        # Последние действия
-        if self.action_history:
-            parts.append("\nПоследние действия:\n")
-            for item in self.action_history[-5:]:
-                action_type = item["action"]["action"]["action_type"]
-                reason = item["action"]["action"].get("reason", "")
-                parts.append(f"  - {action_type}: {reason}\n")
-        
-        # Воспоминания
-        if memories:
-            parts.append("\nПолезные воспоминания:\n")
-            for mem in memories[:3]:
-                parts.append(f"  - {mem}\n")
-        
-        parts.append("\n\nОпредели следующее конкретное действие. Ответ должен содержать JSON с полем 'action'.")
-        
-        return "".join(parts)
-    
-    def _parse_plan_steps(self, response: str, goal: str) -> List[PlanStep]:
-        """Парсит ответ LLM для извлечения шагов плана."""
-        # Простая эвристика для извлечения шагов
-        steps = []
-        lines = response.split('\n')
-        
-        step_number = 1
-        for line in lines:
-            line = line.strip()
-            # Ищем строки вида "1. Описание шага"
-            if line and any(line.startswith(f"{i}.") for i in range(1, 20)):
-                try:
-                    # Извлекаем номер и описание
-                    parts = line.split('.', 1)
-                    if len(parts) == 2:
-                        desc = parts[1].strip()
-                        steps.append(PlanStep(
-                            step_number=step_number,
-                            description=desc,
-                            expected_outcome=f"Шаг {step_number} выполнен"
-                        ))
-                        step_number += 1
-                except Exception:
-                    continue
-        
-        # Если не нашли структурированные шаги, создаём один общий
-        if not steps:
-            steps = [PlanStep(
-                step_number=1,
-                description=f"Выполнить: {goal}",
-                expected_outcome="Задача выполнена"
-            )]
-        
-        return steps
-    
-    def _parse_action(self, response: str) -> ActionSchema:
-        """Парсит ответ LLM для извлечения JSON действия с улучшенной обработкой."""
-        import json
-        import re
-        
-        if not response or not response.strip():
-            logger.warning("Пустой ответ от LLM")
-            return self._fallback_action("Пустой ответ от модели")
-        
-        # Пытаемся найти JSON в ответе (включая markdown блоки)
-        json_patterns = [
-            r'```(?:json)?\s*(\{[^{}]*"action"[^{}]*\})\s*```',  # Markdown блок с action
-            r'```(?:json)?\s*(\{[^{}]*"action_type"[^{}]*\})\s*```',  # Markdown блок с action_type
-            r'(\{[^{}]*"action"[^{}]*\})',  # Объект с полем action
-            r'(\{[^{}]*"action_type"[^{}]*\})',  # Объект с action_type
+        context_parts = [
+            f"Цель: {goal}",
+            f"Окно: {current_state.get('active_window', 'неизвестно')}",
+            f"Мышь: {current_state.get('mouse_position', 'неизвестна')}",
+            f"OCR: {current_state.get('ocr_text', '')[:500]}",
+            f"UI элементы: {len(current_state.get('ui_elements', []))} найдено",
         ]
         
-        for pattern in json_patterns:
-            match = re.search(pattern, response, re.DOTALL | re.IGNORECASE)
-            if match:
-                json_str = match.group(1) if match.lastindex else match.group(0)
-                try:
-                    data = json.loads(json_str)
-                    return ActionSchema.model_validate(data)
-                except json.JSONDecodeError as e:
-                    logger.warning(f"JSON decode error: {e}")
-                    continue
-                except Exception as e:
-                    logger.warning(f"Validation error: {e}")
-                    continue
+        if relevant_memories:
+            context_parts.append(f"Воспоминания: {len(relevant_memories)} найдено")
         
-        # Если не нашли JSON, пробуем распарсить весь ответ
+        user_prompt = "\n".join(context_parts) + "\n\nВерни JSON действия:"
+        
         try:
-            data = json.loads(response.strip())
-            return ActionSchema.model_validate(data)
-        except Exception:
-            pass
+            response = self.ollama_client.chat(
+                model=self.text_model,
+                messages=[
+                    {"role": "system", "content": self.SYSTEM_PROMPT},
+                    {"role": "user", "content": user_prompt}
+                ]
+            )
+            
+            action_dict = self._extract_json_from_response(response)
+            
+            if action_dict and isinstance(action_dict, dict):
+                action = Action.model_validate(action_dict)
+                return action
+            else:
+                print(f"[Planner] Не удалось распарсить ответ: {response[:200]}")
+                return None
+                
+        except Exception as e:
+            print(f"[Planner] Ошибка планирования: {e}")
+            return None
+            
+    def _extract_json_from_response(self, response: str) -> Optional[Dict[str, Any]]:
+        """Извлекает JSON из ответа модели, обрабатывая markdown и шум"""
+        if not response or not isinstance(response, str):
+            return None
         
-        # Fallback: возвращаем действие ожидания
-        return self._fallback_action("Не удалось распарсить ответ LLM")
-    
-    def _fallback_action(self, reason: str) -> ActionSchema:
-        """Создаёт безопасное fallback действие."""
-        from .actions_schema import WaitAction
-        logger.warning(f"Используется fallback действие: {reason}")
-        return ActionSchema(
-            action=WaitAction(seconds=2.0, reason=reason)
-        )
-    
-    def reset(self) -> None:
-        """Сбрасывает текущий план и историю."""
-        self.current_plan = None
-        self.action_history = []
-        logger.info("Planner сброшен")
+        # Сначала пробуем найти JSON в markdown блоках
+        json_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', response, re.DOTALL | re.IGNORECASE)
+        if json_match:
+            json_str = json_match.group(1)
+        else:
+            # Ищем первую и последнюю фигурные скобки
+            start_idx = response.find('{')
+            if start_idx == -1:
+                return None
+                
+            end_idx = response.rfind('}')
+            if end_idx == -1 or end_idx <= start_idx:
+                return None
+                
+            json_str = response[start_idx:end_idx+1]
+        
+        try:
+            data = json.loads(json_str)
+            if not isinstance(data, dict):
+                return None
+            return data
+        except json.JSONDecodeError as e:
+            print(f"[Planner] JSON error: {e}. Fragment: {json_str[:100]}")
+            return None

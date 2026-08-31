@@ -1,313 +1,222 @@
 #!/usr/bin/env python3
 """
-Основной скрипт Neuro Local агента.
-С защитой от зацикливания, утечек памяти и некорректных координат.
+Основной скрипт Neuro Local агента
+С анти-луп детектом, безопасностью и управлением памятью
 """
 import argparse
-import time
 import signal
 import sys
+import time
 import gc
 import json
 from datetime import datetime
 from typing import Dict, Any, Optional, Deque
 from collections import deque
-import logging
 
-# Настройка логирования
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('data/logs/agent.log', encoding='utf-8'),
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger(__name__)
-
-try:
-    from core.ollama_client import OllamaClient
-    from core.config_loader import ConfigLoader
-    from core.planner import Planner
-    from core.safety_manager import SafetyManager
-    from action.action_executor import ActionExecutor
-    from perception.screen_capture import ScreenCapture
-    from perception.ocr_engine import OCREngine
-    from perception.ui_detector import UIDetector
-    from memory.memory_manager import MemoryManager
-    from speech.tts_engine import TTSEngine
-except ImportError as e:
-    print(f"Ошибка импорта: {e}")
-    print("Убедитесь, что все зависимости установлены: pip install -r requirements.txt")
-    sys.exit(1)
+from core.ollama_client import OllamaClient
+from core.config_loader import ConfigLoader
+from core.planner import Planner
+from core.safety_manager import SafetyManager
+from action.action_executor import ActionExecutor
+from perception.screen_capture import ScreenCapture
+from perception.ocr_engine import OCREngine
+from memory.memory_manager import MemoryManager
 
 
 class NeuroLocalAgent:
-    """Основной класс Neuro Local агента с защитой от зацикливания."""
+    """Основной агент с защитой от зацикливания"""
     
     def __init__(self, config_path: str = "./config/config.yaml"):
         self.config = ConfigLoader(config_path)
         
-        # Инициализация компонентов
-        self.ollama_client = OllamaClient(
+        self.ollama = OllamaClient(
             host=self.config.get("ollama.host", "http://127.0.0.1:11434"),
             timeout=self.config.get("ollama.timeout", 120)
         )
-        self.safety_manager = SafetyManager(self.emergency_stop)
-        self.memory_manager = MemoryManager(self.ollama_client, self.config)
-        self.planner = Planner(self.ollama_client, self.config, self.memory_manager)
-        self.action_executor = ActionExecutor(
-            dry_run=not self.config.get("actions.run_mode", False)
-        )
-        self.screen_capture = ScreenCapture()
-        self.ocr_engine = OCREngine()
-        self.ui_detector = UIDetector()
-        self.tts_engine = TTSEngine()
+        self.safety = SafetyManager(self.emergency_stop)
+        self.memory = MemoryManager(self.ollama, self.config)
+        self.planner = Planner(self.ollama, self.config, self.memory)
+        self.executor = ActionExecutor(self.config)
+        self.screen = ScreenCapture()
+        self.ocr = OCREngine()
         
-        # Защита от зацикливания
-        self.action_history: Deque[str] = deque(maxlen=10)
-        self.consecutive_same_action = 0
-        self.max_consecutive = 3
-        
-        # Лимиты
-        self.max_iterations = self.config.get("limits.max_iterations", 100)
-        self.current_iteration = 0
-        
-        # Режим работы
         self.running = False
+        self.dry_run = self.config.get("actions.dry_run", True)
         self.current_goal: Optional[str] = None
         
-        # Обработчики сигналов
+        # Анти-луп детектор
+        self.action_history: Deque[str] = deque(maxlen=10)
+        self.consecutive_same = 0
+        self.max_consecutive = 3
+        
         signal.signal(signal.SIGINT, self.signal_handler)
         signal.signal(signal.SIGTERM, self.signal_handler)
         
-        logger.info("NeuroLocalAgent инициализирован")
-        
     def signal_handler(self, signum, frame):
-        """Обработчик системных сигналов."""
-        logger.warning(f"Получен сигнал {signum}, останавливаю агента...")
+        print(f"\nСигнал {signum}, остановка...")
         self.stop()
         
     def emergency_stop(self):
-        """Аварийная остановка агента."""
-        logger.critical("[АВАРИЙНАЯ ОСТАНОВКА] Агент остановлен по сигналу безопасности!")
+        print("\n[АВАРИЙНАЯ ОСТАНОВКА]")
         self.running = False
         self.cleanup()
         sys.exit(0)
         
-    def start(self, goal: str = None):
-        """Запускает агента с указанной целью."""
-        if goal:
-            self.current_goal = goal
-        elif not self.current_goal:
-            self.current_goal = input("Введите цель для агента: ").strip()
-            
+    def start(self, goal: Optional[str] = None):
+        """Запуск агента"""
+        self.current_goal = goal or input("Цель: ").strip()
+        
         if not self.current_goal:
-            print("Цель не указана, завершение.")
+            print("Цель не указана")
             return
             
-        logger.info(f"Агент запущен с целью: {self.current_goal}")
-        print("Для аварийной остановки нажмите Ctrl+Alt+Q")
+        print(f"Запуск с целью: {self.current_goal}")
+        print(f"Режим: {'БОЕВОЙ' if not self.dry_run else 'СИМУЛЯЦИЯ'}")
+        print("Аварийная остановка: Ctrl+Alt+Q")
         
         self.running = True
-        self.current_iteration = 0
+        self.executor.set_dry_run(self.dry_run)
         
-        # Основной цикл агента
-        while self.running:
+        iteration = 0
+        max_iterations = 100  # Лимит итераций
+        
+        while self.running and iteration < max_iterations:
             try:
-                self.current_iteration += 1
-                
-                # Проверка лимита итераций
-                if self.current_iteration > self.max_iterations:
-                    logger.warning(f"Достигнут лимит итераций ({self.max_iterations})")
-                    self.memory_manager.save_fact(
-                        "limit_reached",
-                        f"Лимит итераций {self.max_iterations} достигнут при цели: {self.current_goal}"
-                    )
-                    break
-                
                 self.step()
-                
+                iteration += 1
             except KeyboardInterrupt:
-                logger.info("Остановлен пользователем")
                 break
             except Exception as e:
-                logger.exception(f"Ошибка в основном цикле: {e}")
-                self.memory_manager.save_error(
-                    error_type="agent_loop_error",
-                    error_message=str(e),
-                    context={"goal": self.current_goal, "iteration": self.current_iteration}
-                )
+                print(f"Ошибка: {e}")
+                self.memory.save_error("agent_error", str(e), {"iteration": iteration})
                 break
-                
+        
         self.stop()
         
     def step(self):
-        """Один шаг работы агента с проверкой на зацикливание."""
-        # 1. Восприятие окружающей среды
-        perception_data = self.perceive_environment()
+        """Один шаг работы"""
+        # Восприятие
+        perception = self.perceive()
         
-        # 2. Извлечение релевантных воспоминаний
-        relevant_memories = self.memory_manager.retrieve_relevant_memories(
-            self.current_goal, top_k=5
-        )
+        # Поиск воспоминаний
+        memories = self.memory.retrieve_relevant_memories(self.current_goal, top_k=3)
         
-        # 3. Планирование следующего действия
-        action = self.planner.plan_next_action(
-            goal=self.current_goal,
-            current_state=perception_data,
-            relevant_memories=relevant_memories
-        )
+        # Планирование
+        action = self.planner.plan_next_action(self.current_goal, perception, memories)
         
-        if action is None:
-            logger.warning("Не удалось спланировать следующее действие")
+        if not action:
+            print("Нет действия для выполнения")
             time.sleep(2)
             return
-            
-        # 4. Проверка на зацикливание
-        action_signature = json.dumps(action.model_dump(), sort_keys=True)
         
-        if len(self.action_history) > 0 and self.action_history[-1] == action_signature:
-            self.consecutive_same_action += 1
-            if self.consecutive_same_action >= self.max_consecutive:
-                logger.error(
-                    f"[LOOP DETECTED] Действие повторяется {self.consecutive_same_action} раз. Прерывание."
-                )
-                self.memory_manager.save_error(
-                    "loop_detected",
-                    "Agent stuck in loop",
-                    {"action": action_signature, "count": self.consecutive_same_action}
-                )
-                self.tts_engine.speak("Обнаружено зацикливание. Останавливаюсь.")
+        # Проверка на зацикливание
+        action_sig = str(action.model_dump())
+        if self.action_history and self.action_history[-1] == action_sig:
+            self.consecutive_same += 1
+            if self.consecutive_same >= self.max_consecutive:
+                print(f"[LOOP] Действие повторяется {self.consecutive_same} раз. Стоп.")
+                self.memory.save_error("loop_detected", "Зацикливание", {"action": action_sig})
                 self.running = False
                 return
         else:
-            self.consecutive_same_action = 0
-            
-        self.action_history.append(action_signature)
+            self.consecutive_same = 0
         
-        # 5. Проверка безопасности действия
-        is_safe, reason = self.safety_manager.validate_and_filter_action(action)
+        self.action_history.append(action_sig)
+        
+        # Безопасность
+        is_safe, reason = self.safety.validate_and_filter_action(action)
         if not is_safe:
-            logger.warning(f"Действие заблокировано: {reason}")
+            print(f"[SAFETY] Заблокировано: {reason}")
             return
-            
-        # 6. Выполнение действия
-        execution_result = self.action_executor.execute(action)
         
-        # 7. Сохранение эпизода в память
-        self.memory_manager.save_episode(
+        # Выполнение
+        result = self.executor.execute_action(action)
+        
+        # Сохранение эпизода
+        self.memory.save_episode(
             goal=self.current_goal,
-            perception=perception_data,
+            perception=perception,
             plan={},
             action=action.model_dump(),
-            result=execution_result
+            result=result
         )
         
-        # 8. Проверка завершения цели (упрощенная)
-        if self._is_goal_completed(action, execution_result):
-            logger.info(f"Цель достигнута: {self.current_goal}")
-            self.tts_engine.speak("Задача выполнена успешно.")
-            self.running = False
-            
-        # 9. Очистка памяти
-        del perception_data
+        # Логирование
+        self.log_interaction(perception, action, result)
+        
+        # Очистка памяти
+        del perception
         gc.collect()
         
-        # 10. Задержка между итерациями
         time.sleep(self.config.get("actions.default_delay", 0.5))
         
-    def perceive_environment(self) -> Dict[str, Any]:
-        """Воспринимает текущее состояние окружающей среды."""
+    def perceive(self) -> Dict[str, Any]:
+        """Восприятие среды"""
+        screenshot = self.screen.take_screenshot()
+        
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        screenshot.save(f"./data/screenshots/{ts}.png")
+        
+        ocr_text = self.ocr.extract_text(screenshot)
+        
         try:
-            # Захват скриншота
-            screenshot = self.screen_capture.take_screenshot()
-            
-            # Сохраняем скриншот для отладки
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            screenshot_path = f"./data/screenshots/{timestamp}.png"
-            screenshot.save(screenshot_path)
-            
-            # OCR
-            ocr_text = self.ocr_engine.extract_text(screenshot)
-            
-            # Обнаружение UI-элементов
-            ui_elements = self.ui_detector.detect_ui_elements(screenshot)
-            
-            # Получаем активное окно
-            active_window = self._get_active_window()
-            
-            # Получаем позицию мыши
             import pyautogui
             mouse_pos = pyautogui.position()
-            
-            # Получаем последние действия из памяти
-            recent_episodes = self.memory_manager.storage.get_recent_episodes(limit=5)
-            recent_actions = [ep.get("action", {}) for ep in recent_episodes]
-            
-            perception_data = {
-                "timestamp": datetime.now().isoformat(),
-                "active_window": active_window,
-                "mouse_position": {"x": mouse_pos.x, "y": mouse_pos.y},
-                "ocr_text": ocr_text[:1000] if ocr_text else "",  # Ограничиваем размер
-                "ui_elements": [elem.model_dump() for elem in ui_elements[:20]],  # Топ-20 элементов
-                "recent_actions": recent_actions,
-                "screenshot_path": screenshot_path
-            }
-            
-            return perception_data
-            
-        except Exception as e:
-            logger.exception(f"Ошибка восприятия: {e}")
-            return {
-                "timestamp": datetime.now().isoformat(),
-                "error": str(e)
-            }
+        except:
+            mouse_pos = (0, 0)
         
-    def _get_active_window(self) -> str:
-        """Получает название активного окна."""
-        try:
-            import pygetwindow as gw
-            active_window = gw.getActiveWindow()
-            return active_window.title if active_window else "unknown"
-        except ImportError:
-            logger.warning("pygetwindow не установлен")
-            return "unknown_window"
-        except Exception as e:
-            logger.error(f"Ошибка получения активного окна: {e}")
-            return "error"
-            
-    def _is_goal_completed(self, action, result) -> bool:
-        """Проверяет, достигнута ли цель (упрощенная реализация)."""
-        # В реальной системе здесь была бы более сложная логика
-        return False
+        return {
+            "timestamp": datetime.now().isoformat(),
+            "mouse_position": {"x": mouse_pos[0], "y": mouse_pos[1]},
+            "ocr_text": ocr_text[:1000] if ocr_text else "",
+            "screenshot_path": f"./data/screenshots/{ts}.png"
+        }
         
+    def log_interaction(self, perception: Dict, action, result: Dict):
+        """Логирование в JSONL"""
+        logs_dir = self.config.get("paths.logs_dir", "./data/logs")
+        import os
+        os.makedirs(logs_dir, exist_ok=True)
+        
+        log_entry = {
+            "timestamp": datetime.now().isoformat(),
+            "goal": self.current_goal,
+            "perception": perception,
+            "action": action.model_dump() if hasattr(action, 'model_dump') else str(action),
+            "result": result
+        }
+        
+        log_file = f"{logs_dir}/{datetime.now().strftime('%Y-%m-%d')}.jsonl"
+        with open(log_file, 'a', encoding='utf-8') as f:
+            f.write(json.dumps(log_entry, ensure_ascii=False) + '\n')
+            
     def stop(self):
-        """Останавливает агента."""
-        logger.info("Останавливаю агента...")
+        """Остановка"""
+        print("Остановка...")
         self.running = False
         self.cleanup()
         
     def cleanup(self):
-        """Очистка ресурсов."""
-        self.safety_manager.cleanup()
-        gc.collect()
-        logger.info("Ресурсы очищены")
+        """Очистка"""
+        self.safety.cleanup()
+        print("Ресурсы очищены")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Neuro Local - Локальный ИИ-агент")
-    parser.add_argument("--run", action="store_true", help="Режим боевых действий")
-    parser.add_argument("--goal", type=str, help="Цель для агента")
-    parser.add_argument("--config", type=str, default="./config/config.yaml", help="Путь к конфигу")
+    parser = argparse.ArgumentParser(description="Neuro Local Agent")
+    parser.add_argument("--run", action="store_true", help="Боевой режим")
+    parser.add_argument("--goal", type=str, help="Цель")
+    parser.add_argument("--config", type=str, default="./config/config.yaml")
     
     args = parser.parse_args()
     
+    agent = NeuroLocalAgent(config_path=args.config)
+    agent.dry_run = not args.run
+    
     try:
-        agent = NeuroLocalAgent(config_path=args.config)
         agent.start(goal=args.goal)
     except Exception as e:
-        logger.exception(f"Ошибка при запуске агента: {e}")
+        print(f"Ошибка запуска: {e}")
         sys.exit(1)
 
 

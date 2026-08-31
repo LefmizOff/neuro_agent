@@ -1,248 +1,143 @@
 #!/usr/bin/env python3
 """
-Минимальный рабочий агент Neuro.
-
-Скриншот → qwen2.5vl:7b → JSON-действие → dry-run или --run
-
-Использование:
-    python mini_agent.py --dry-run     # Режим просмотра (по умолчанию)
-    python mini_agent.py --run         # Боевой режим
+Минимальный рабочий агент: скриншот → qwen2.5vl:7b → JSON-действие → dry-run/--run
+С исправлениями: таймауты, кириллица, безопасность, парсинг JSON
 """
-
 import argparse
-import logging
-import sys
-from datetime import datetime
-from pathlib import Path
+import json
+import base64
+from io import BytesIO
+from PIL import Image
+import pyautogui
 
-# Добавляем корень проекта в path
-sys.path.insert(0, str(Path(__file__).parent))
-
-from core.ollama_client import OllamaClient, VisionModel, LLMModel
-from core.actions_schema import ActionSchema, WaitAction
+from core.ollama_client import OllamaClient
+from core.config_loader import ConfigLoader
+from core.actions_schema import Action
 from perception.screen_capture import ScreenCapture
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+from perception.ocr_engine import OCREngine
+from action.action_executor import ActionExecutor
 
 
-SYSTEM_PROMPT = """Ты — визуальный ИИ-ассистент Neuro. Твоя задача — анализировать скриншоты экрана и определять следующее действие.
-
-Доступные типы действий:
-- click: клик мышью (требует x, y координаты)
-- double_click: двойной клик
-- right_click: правый клик
-- move: перемещение мыши
-- type: ввод текста
-- press_key: нажатие клавиши
-- hotkey: комбинация клавиш (например, ["ctrl", "c"])
-- wait: ожидание (в секундах)
-- scroll: прокрутка
-- none: бездействие
-
-Ответь ТОЛЬКО JSON объектом в формате:
-{
-    "action": {
-        "action_type": "<тип>",
-        ...параметры...
-        "reason": "<обоснование>"
-    },
-    "confidence": 0.0-1.0
-}
-
-Пример ответа для клика:
-{
-    "action": {
-        "action_type": "click",
-        "target": {"x": 100, "y": 200},
-        "button": "left",
-        "reason": "Нажать кнопку Сохранить"
-    },
-    "confidence": 0.95
-}"""
-
-
-class MiniAgent:
-    """Минимальный агент."""
+def extract_json_from_response(response: str):
+    """Извлекает JSON из ответа модели"""
+    if not response:
+        return None
     
-    def __init__(self, dry_run: bool = True):
-        """Инициализация агента."""
-        self.dry_run = dry_run
-        
-        # Инициализация компонентов
-        self.ollama = OllamaClient()
-        self.screen = ScreenCapture()
-        
-        logger.info(f"MiniAgent инициализирован (dry_run={dry_run})")
+    import re
+    # Ищем в markdown блоках
+    match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', response, re.DOTALL | re.IGNORECASE)
+    if match:
+        json_str = match.group(1)
+    else:
+        start = response.find('{')
+        end = response.rfind('}')
+        if start == -1 or end == -1:
+            return None
+        json_str = response[start:end+1]
     
-    def run_cycle(self, goal: str = "Опиши что видишь и предложи действие") -> dict:
-        """
-        Выполняет один цикл работы агента.
-        
-        Args:
-            goal: Цель/задача для текущего цикла
-            
-        Returns:
-            Результат выполнения
-        """
-        result = {
-            "timestamp": datetime.now().isoformat(),
-            "goal": goal,
-            "success": False
-        }
-        
-        try:
-            # 1. Делаем скриншот
-            logger.info("Захват скриншота...")
-            screenshot = self.screen.capture_full()
-            
-            # 2. Отправляем в VLM
-            logger.info("Анализ скриншота через qwen2.5vl:7b...")
-            prompt = f"{goal}\n\nПроанализируй этот скриншот и определи следующее действие."
-            
-            response = self.ollama.vision_chat(
-                image=screenshot,
-                prompt=prompt,
-                system_prompt=SYSTEM_PROMPT,
-                temperature=0.3,
-                max_tokens=1024
-            )
-            
-            result["vision_response"] = response[:500] + "..." if len(response) > 500 else response
-            
-            # 3. Парсим ответ для извлечения действия
-            action = self._parse_action(response)
-            result["action"] = action.to_dict()
-            
-            # 4. Выполняем действие
-            if self.dry_run:
-                logger.info(f"[DRY-RUN] Действие: {action.action.action_type.value}")
-                logger.info(f"  Причина: {action.action.reason}")
-                result["executed"] = False
-                result["dry_run"] = True
-            else:
-                logger.info(f"Выполнение действия: {action.action.action_type.value}")
-                # TODO: Интегрировать ActionExecutor
-                result["executed"] = True
-                result["dry_run"] = False
-            
-            result["success"] = True
-            
-        except Exception as e:
-            logger.error(f"Ошибка цикла: {e}")
-            result["error"] = str(e)
-        
-        return result
-    
-    def _parse_action(self, response: str) -> ActionSchema:
-        """Парсит ответ LLM для извлечения действия."""
-        import json
-        import re
-        
-        # Пытаемся найти JSON в ответе
-        json_match = re.search(r'\{[^{}]*"action"[^{}]*\}', response, re.DOTALL)
-        
-        if json_match:
-            try:
-                data = json.loads(json_match.group())
-                return ActionSchema.model_validate(data)
-            except Exception:
-                pass
-        
-        # Fallback - действие ожидания
-        return ActionSchema(
-            action=WaitAction(seconds=2.0, reason="Не удалось распарсить ответ LLM")
-        )
-    
-    def interactive_loop(self, max_cycles: int = 10):
-        """
-        Интерактивный цикл работы агента.
-        
-        Args:
-            max_cycles: Максимум циклов работы
-        """
-        print("\n" + "="*50)
-        print("Neuro Mini Agent запущен")
-        print(f"Режим: {'DRY-RUN' if self.dry_run else 'БОЕВОЙ'}")
-        print("="*50)
-        print("Команды:")
-        print("  quit/exit - выход")
-        print("  [текст] - выполнить задачу")
-        print("="*50 + "\n")
-        
-        for i in range(max_cycles):
-            try:
-                goal = input(f"\n[{i+1}] Задача: ").strip()
-                
-                if goal.lower() in ['quit', 'exit', 'q']:
-                    break
-                
-                if not goal:
-                    goal = "Опиши что видишь на экране"
-                
-                result = self.run_cycle(goal)
-                
-                print(f"\nРезультат:")
-                print(f"  Успех: {result['success']}")
-                if 'action' in result:
-                    print(f"  Действие: {result['action']['action']['action_type']}")
-                    print(f"  Причина: {result['action']['action']['reason']}")
-                if 'error' in result:
-                    print(f"  Ошибка: {result['error']}")
-                
-            except KeyboardInterrupt:
-                print("\n\nПрервано пользователем")
-                break
-        
-        print("\nАгент остановлен")
+    try:
+        data = json.loads(json_str)
+        return data if isinstance(data, dict) else None
+    except:
+        return None
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Neuro Mini Agent")
-    parser.add_argument(
-        '--run',
-        action='store_true',
-        help='Боевой режим (выполнять действия)'
-    )
-    parser.add_argument(
-        '--dry-run',
-        action='store_true',
-        default=True,
-        help='Режим просмотра (по умолчанию)'
-    )
-    parser.add_argument(
-        '--once',
-        action='store_true',
-        help='Выполнить один цикл и выйти'
-    )
-    
+    parser = argparse.ArgumentParser(description="Mini Agent Neuro Local")
+    parser.add_argument("--run", action="store_true", help="Боевой режим (по умолчанию dry-run)")
     args = parser.parse_args()
+
+    print("=" * 50)
+    print("  NEURO LOCAL - Мини Агент")
+    print("=" * 50)
+    print(f"Режим: {'БОЕВОЙ' if args.run else 'СИМУЛЯЦИЯ (dry-run)'}")
+    print()
+
+    # Инициализация
+    config = ConfigLoader()
+    ollama = OllamaClient(timeout=config.get("ollama.timeout", 120))
+    screen = ScreenCapture()
+    ocr = OCREngine()
+    executor = ActionExecutor(config)
+    executor.set_dry_run(not args.run)
+
+    pyautogui.FAILSAFE = True
+
+    # 1. Скриншот
+    print("[1/4] Делаю скриншот...")
+    screenshot = screen.take_screenshot()
+    screenshot.save("./data/screenshots/latest.png")
+    print(f"  Размер: {screenshot.size}")
+
+    # 2. OCR
+    print("[2/4] Распознаю текст (OCR)...")
+    ocr_text = ocr.extract_text(screenshot)
+    print(f"  Найдено символов: {len(ocr_text)}")
+
+    # 3. Анализ через VLM
+    print("[3/4] Анализирую экран (qwen2.5vl:7b)...")
+    buffered = BytesIO()
+    screenshot.save(buffered, format="PNG")
+    img_b64 = base64.b64encode(buffered.getvalue()).decode()
+
+    vision_prompt = f"Опиши экран. Что видишь? Есть ли кнопки, поля, окна? OCR текст: {ocr_text[:500]}"
     
-    dry_run = not args.run
+    try:
+        vision_response = ollama.chat(
+            model="qwen2.5vl:7b",
+            messages=[
+                {"role": "user", "content": vision_prompt},
+                {"role": "user", "images": [img_b64]}
+            ]
+        )
+        print(f"  Анализ: {vision_response[:200]}...")
+    except Exception as e:
+        print(f"  Ошибка VLM: {e}")
+        vision_response = "Не удалось проанализировать"
+
+    # 4. Планирование действия
+    print("[4/4] Планирую действие (qwen2.5:7b-instruct)...")
+    mouse_pos = pyautogui.position()
     
-    # Проверка доступности Ollama
-    ollama = OllamaClient()
-    if not ollama.is_available():
-        logger.error("Ollama недоступен! Убедитесь, что сервис запущен.")
-        sys.exit(1)
-    
-    # Проверка моделей
-    models = ollama.check_required_models()
-    if not all(models.values()):
-        logger.warning(f"Не все модели доступны: {models}")
-        logger.warning("Установите модели: ollama pull qwen2.5vl:7b && ollama pull qwen2.5:7b-instruct")
-    
-    # Запуск агента
-    agent = MiniAgent(dry_run=dry_run)
-    
-    if args.once:
-        result = agent.run_cycle()
-        print(f"Результат: {result}")
-    else:
-        agent.interactive_loop()
+    plan_prompt = f"""Цель: тестирование агента
+Экран: {vision_response[:300]}
+Мышь: {mouse_pos}
+OCR: {ocr_text[:200]}
+
+Верни JSON действия (type, position для мыши, text/key для клавиатуры):"""
+
+    try:
+        action_response = ollama.chat(
+            model="qwen2.5:7b-instruct",
+            messages=[{"role": "user", "content": plan_prompt}]
+        )
+        
+        action_dict = extract_json_from_response(action_response)
+        
+        if action_dict:
+            print(f"  Действие: {action_dict}")
+            
+            try:
+                action = Action.model_validate(action_dict)
+                
+                if args.run:
+                    print("\n[ВЫПОЛНЕНИЕ] Реальное действие...")
+                    result = executor.execute_action(action)
+                    print(f"  Результат: {result}")
+                else:
+                    print("\n[DRY-RUN] Действие не выполнено (симуляция)")
+                    
+            except Exception as e:
+                print(f"  Ошибка валидации: {e}")
+        else:
+            print(f"  Не удалось распарсить JSON из: {action_response[:200]}")
+            
+    except Exception as e:
+        print(f"  Ошибка планирования: {e}")
+
+    print("\n" + "=" * 50)
+    print("Завершено")
+    print("=" * 50)
 
 
 if __name__ == "__main__":

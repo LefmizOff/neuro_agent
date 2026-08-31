@@ -305,37 +305,52 @@ class Planner:
         return steps
     
     def _parse_action(self, response: str) -> ActionSchema:
-        """Парсит ответ LLM для извлечения JSON действия."""
+        """Парсит ответ LLM для извлечения JSON действия с улучшенной обработкой."""
         import json
         import re
         
-        # Пытаемся найти JSON в ответе
+        if not response or not response.strip():
+            logger.warning("Пустой ответ от LLM")
+            return self._fallback_action("Пустой ответ от модели")
+        
+        # Пытаемся найти JSON в ответе (включая markdown блоки)
         json_patterns = [
-            r'\{[^{}]*"action"[^{}]*\}',  # Объект с полем action
-            r'\{[^{}]*"action_type"[^{}]*\}',  # Объект с action_type
+            r'```(?:json)?\s*(\{[^{}]*"action"[^{}]*\})\s*```',  # Markdown блок с action
+            r'```(?:json)?\s*(\{[^{}]*"action_type"[^{}]*\})\s*```',  # Markdown блок с action_type
+            r'(\{[^{}]*"action"[^{}]*\})',  # Объект с полем action
+            r'(\{[^{}]*"action_type"[^{}]*\})',  # Объект с action_type
         ]
         
         for pattern in json_patterns:
-            match = re.search(pattern, response, re.DOTALL)
+            match = re.search(pattern, response, re.DOTALL | re.IGNORECASE)
             if match:
+                json_str = match.group(1) if match.lastindex else match.group(0)
                 try:
-                    data = json.loads(match.group())
+                    data = json.loads(json_str)
                     return ActionSchema.model_validate(data)
-                except Exception:
+                except json.JSONDecodeError as e:
+                    logger.warning(f"JSON decode error: {e}")
+                    continue
+                except Exception as e:
+                    logger.warning(f"Validation error: {e}")
                     continue
         
         # Если не нашли JSON, пробуем распарсить весь ответ
         try:
-            # Предполагаем, что ответ может быть JSON
-            data = json.loads(response)
+            data = json.loads(response.strip())
             return ActionSchema.model_validate(data)
         except Exception:
             pass
         
         # Fallback: возвращаем действие ожидания
+        return self._fallback_action("Не удалось распарсить ответ LLM")
+    
+    def _fallback_action(self, reason: str) -> ActionSchema:
+        """Создаёт безопасное fallback действие."""
         from .actions_schema import WaitAction
+        logger.warning(f"Используется fallback действие: {reason}")
         return ActionSchema(
-            action=WaitAction(seconds=1.0, reason="Не удалось распарсить ответ LLM")
+            action=WaitAction(seconds=2.0, reason=reason)
         )
     
     def reset(self) -> None:

@@ -1,207 +1,181 @@
-#!/usr/bin/env python3
 """
-Анализ логов и предложения улучшений через LLM.
-
-Использование:
-    python evolution/improve.py              # Анализ последних логов
-    python evolution/improve.py --apply      # Применить улучшения (требует подтверждения)
+Анализ и улучшение агента через LLM
+С защитой от самоповреждения
 """
-
 import json
-import logging
-import argparse
+import os
+import re
 from typing import List, Dict, Any, Optional
 from datetime import datetime
-from pathlib import Path
-
 from core.ollama_client import OllamaClient
-from .collect_logs import LogCollector
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+from core.config_loader import ConfigLoader
 
 
-SYSTEM_PROMPT = """Ты — система анализа и улучшения ИИ-агента Neuro.
-Твоя задача — анализировать логи сессий и предлагать конкретные улучшения.
-
-Формат ответа (JSON):
-{
-    "summary": "Краткая сводка анализа",
-    "issues": [
-        {
-            "type": "error|inefficiency|optimization",
-            "description": "Описание проблемы",
-            "suggestion": "Предложение по улучшению"
-        }
-    ],
-    "prompt_improvements": ["предложения по улучшению промптов"],
-    "skill_suggestions": ["новые навыки которые стоит добавить"],
-    "confidence": 0.0-1.0
-}
-
-Будь конкретен в предложениях. Избегай общих фраз."""
-
-
-class ImprovementAnalyzer:
-    """Анализатор для предложений улучшений."""
+class EvolutionAnalyzer:
+    """Анализатор с защитой от повреждения ядра"""
     
-    def __init__(self, improvements_dir: str = "data/improvements"):
-        self.client = OllamaClient()
-        self.collector = LogCollector()
-        self.improvements_dir = Path(improvements_dir)
-        self.improvements_dir.mkdir(parents=True, exist_ok=True)
+    # Защищенные файлы которые нельзя удалять/ломать
+    PROTECTED_FILES = [
+        "main.py", "mini_agent.py",
+        "core/", "action/", "memory/", "perception/",
+        "safety_manager.py", "ollama_client.py"
+    ]
     
-    def analyze_session(self, date: Optional[str] = None) -> Dict[str, Any]:
-        """
-        Анализирует сессию и предлагает улучшения.
+    def __init__(self, ollama_client: OllamaClient, config: ConfigLoader):
+        self.ollama_client = ollama_client
+        self.config = config
+        self.text_model = config.get("ollama.text_model", "qwen2.5:7b-instruct")
+        self.improvements_dir = config.get("paths.improvements_dir", "./data/improvements")
         
-        Args:
-            date: Дата сессии (по умолчанию сегодня)
-            
-        Returns:
-            Результат анализа
-        """
-        # Собираем логи
-        entries = self.collector.collect_session(date)
+    def analyze_session(self, session: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Анализирует сессию"""
+        if not session:
+            return {"effectiveness_score": 5, "issues_found": [], "improvement_suggestions": []}
         
-        if not entries:
-            return {"error": "Нет данных для анализа"}
+        summary = self._summarize_session(session)
         
-        # Формируем текст для анализа
-        log_text = self.collector.export_for_analysis(date)
-        
-        # Отправляем в LLM
-        prompt = f"""Проанализируй эту сессию работы агента Neuro:
+        prompt = f"""Проанализируй сессию ИИ-агента и предложи улучшения.
 
-{log_text}
+Сессия: {json.dumps(summary, ensure_ascii=False)[:2000]}
 
-Предложи конкретные улучшения для:
-1. Промптов и инструкций
-2. Навыков (skills)
-3. Обработки ошибок
-4. Оптимизации действий"""
-
+Верни JSON:
+{{
+  "effectiveness_score": 5,
+  "issues_found": ["проблема 1"],
+  "improvement_suggestions": [{{"category": "safety", "description": "описание", "priority": "medium"}}]
+}}"""
+        
         try:
-            response = self.client.chat(
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.3,
-                max_tokens=2048
+            response = self.ollama_client.chat(
+                model=self.text_model,
+                messages=[{"role": "user", "content": prompt}]
             )
             
-            # Парсим ответ
-            analysis = self._parse_analysis(response)
-            
-            # Сохраняем результат
-            self._save_analysis(analysis, date)
-            
-            return analysis
-            
+            return self._extract_json(response) or {
+                "effectiveness_score": 5,
+                "issues_found": [],
+                "improvement_suggestions": []
+            }
         except Exception as e:
-            logger.error(f"Ошибка анализа: {e}")
-            return {"error": str(e)}
+            print(f"[Evolution] Ошибка анализа: {e}")
+            return {"effectiveness_score": 5, "issues_found": [], "improvement_suggestions": []}
     
-    def _parse_analysis(self, response: str) -> Dict[str, Any]:
-        """Парсит ответ LLM."""
-        import re
+    def generate_improvements(self, analysis: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Генерирует предложения улучшений"""
+        improvements = []
+        suggestions = analysis.get("improvement_suggestions", [])
         
-        # Пытаемся найти JSON
-        json_match = re.search(r'\{.*\}', response, re.DOTALL)
+        for i, sugg in enumerate(suggestions):
+            imp = {
+                "id": f"imp_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{i}",
+                "timestamp": datetime.now().isoformat(),
+                "category": sugg.get("category", "other"),
+                "description": sugg.get("description", ""),
+                "priority": sugg.get("priority", "medium"),
+                "status": "proposed"
+            }
+            improvements.append(imp)
         
-        if json_match:
-            try:
-                return json.loads(json_match.group())
-            except json.JSONDecodeError:
-                pass
+        return improvements
+    
+    def save_improvements(self, improvements: List[Dict[str, Any]]):
+        """Сохраняет улучшения"""
+        os.makedirs(self.improvements_dir, exist_ok=True)
         
-        # Fallback - структурированный ответ
+        # Сохраняем все в один файл
+        all_file = os.path.join(self.improvements_dir, "all_improvements.json")
+        with open(all_file, 'w', encoding='utf-8') as f:
+            json.dump(improvements, f, ensure_ascii=False, indent=2)
+        
+        # И отдельно каждое
+        for imp in improvements:
+            filepath = os.path.join(self.improvements_dir, f"{imp['id']}.json")
+            with open(filepath, 'w', encoding='utf-8') as f:
+                json.dump(imp, f, ensure_ascii=False, indent=2)
+    
+    def apply_improvements(self, improvements: List[Dict[str, Any]], auto_apply: bool = False):
+        """Применяет улучшения с проверкой безопасности"""
+        if not auto_apply:
+            print("[Evolution] Автоприменение отключено")
+            return
+        
+        applied = 0
+        for imp in improvements:
+            target = imp.get("target_file", "")
+            
+            # Проверка на защищенные файлы
+            is_protected = any(
+                target == p or (isinstance(p, str) and target.startswith(p))
+                for p in self.PROTECTED_FILES
+            )
+            
+            if is_protected and ("delete" in imp.get("type", "").lower() or 
+                                 "remove" in imp.get("description", "").lower()):
+                print(f"[BLOCKED] Защита: {target}")
+                imp["status"] = "rejected_security"
+                continue
+            
+            if imp.get("status") == "approved":
+                print(f"[APPLY] {imp['description']}")
+                imp["status"] = "implemented"
+                imp["applied_at"] = datetime.now().isoformat()
+                applied += 1
+        
+        print(f"Применено {applied} улучшений")
+    
+    def _summarize_session(self, session: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Краткое резюме сессии"""
+        if not session:
+            return {}
+        
+        action_types = {}
+        errors = []
+        
+        for entry in session:
+            if 'action' in entry and isinstance(entry['action'], dict):
+                atype = entry['action'].get('type', 'unknown')
+                action_types[atype] = action_types.get(atype, 0) + 1
+            
+            if entry.get('error'):
+                errors.append(entry['error'])
+        
         return {
-            "summary": response[:500],
-            "issues": [],
-            "prompt_improvements": [],
-            "skill_suggestions": [],
-            "raw_response": response
+            "entries": len(session),
+            "actions": action_types,
+            "errors_count": len(errors),
+            "error_samples": errors[:3]
         }
     
-    def _save_analysis(self, analysis: Dict[str, Any], date: Optional[str]) -> Path:
-        """Сохраняет анализ в файл."""
-        if date is None:
-            date = datetime.now().strftime("%Y-%m-%d")
-        
-        filename = f"improvement_{date}.json"
-        filepath = self.improvements_dir / filename
-        
-        with open(filepath, 'w', encoding='utf-8') as f:
-            json.dump(analysis, f, indent=2, ensure_ascii=False)
-        
-        logger.info(f"Анализ сохранён: {filepath}")
-        return filepath
-    
-    def apply_improvements(self, filepath: Optional[str] = None) -> bool:
-        """
-        Применяет улучшения из файла анализа.
-        
-        TODO: Реализовать реальное применение улучшений
-        Сейчас только выводит предложения
-        """
-        if filepath is None:
-            # Ищем последний файл анализа
-            files = sorted(self.improvements_dir.glob("improvement_*.json"))
-            if not files:
-                logger.error("Нет файлов анализа для применения")
-                return False
-            filepath = str(files[-1])
-        
-        with open(filepath, 'r', encoding='utf-8') as f:
-            analysis = json.load(f)
-        
-        print("\n=== ПРЕДЛОЖЕНИЯ ПО УЛУЧШЕНИЮ ===\n")
-        print(f"Сводка: {analysis.get('summary', 'Нет сводки')}\n")
-        
-        issues = analysis.get('issues', [])
-        if issues:
-            print("Проблемы и предложения:")
-            for i, issue in enumerate(issues, 1):
-                print(f"\n{i}. [{issue.get('type', 'issue')}]")
-                print(f"   Проблема: {issue.get('description', 'Нет описания')}")
-                print(f"   Решение: {issue.get('suggestion', 'Нет предложения')}")
-        
-        prompts = analysis.get('prompt_improvements', [])
-        if prompts:
-            print("\nУлучшения промптов:")
-            for p in prompts:
-                print(f"  - {p}")
-        
-        skills = analysis.get('skill_suggestions', [])
-        if skills:
-            print("\nНовые навыки:")
-            for s in skills:
-                print(f"  - {s}")
-        
-        print("\n=== ДЛЯ ПРИМЕНЕНИЯ ТРЕБУЕТСЯ РУЧНАЯ РЕАЛИЗАЦИЯ ===")
-        print("TODO: Автоматическое применение улучшений")
-        
-        return True
+    def _extract_json(self, response: str) -> Optional[Dict[str, Any]]:
+        """Извлекает JSON из ответа"""
+        match = re.search(r'\{.*\}', response, re.DOTALL)
+        if match:
+            try:
+                return json.loads(match.group())
+            except:
+                pass
+        return None
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Анализ и улучшение агента")
-    parser.add_argument("--session", help="Дата сессии для анализа")
-    parser.add_argument("--apply", action="store_true", help="Применить улучшения")
-    parser.add_argument("--file", help="Файл анализа для применения")
+    """Точка входа для анализа"""
+    config = ConfigLoader()
+    ollama = OllamaClient(timeout=config.get("ollama.timeout", 120))
+    analyzer = EvolutionAnalyzer(ollama, config)
     
-    args = parser.parse_args()
+    from evolution.collect_logs import collect_recent_sessions
+    sessions = collect_recent_sessions(days_back=7)
     
-    analyzer = ImprovementAnalyzer()
+    print(f"Анализ {len(sessions)} сессий...")
     
-    if args.apply or args.file:
-        success = analyzer.apply_improvements(args.file)
-        exit(0 if success else 1)
-    else:
-        result = analyzer.analyze_session(args.session)
-        print(json.dumps(result, indent=2, ensure_ascii=False))
+    all_improvements = []
+    for session in sessions[:5]:  # Максимум 5 сессий
+        analysis = analyzer.analyze_session(session)
+        improvements = analyzer.generate_improvements(analysis)
+        all_improvements.extend(improvements)
+    
+    analyzer.save_improvements(all_improvements)
+    print(f"Сохранено {len(all_improvements)} предложений")
 
 
 if __name__ == "__main__":

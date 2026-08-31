@@ -1,15 +1,10 @@
-"""
-Клиент для взаимодействия с Ollama API
-Исправлено: добавлены таймауты, обработка ошибок
-"""
 import requests
 import json
 from typing import Dict, Any, List, Optional
 from urllib.parse import urljoin
 
-
 class OllamaClient:
-    """Клиент для работы с Ollama API"""
+    """Клиент для работы с Ollama API с таймаутами и обработкой ошибок"""
     def __init__(self, host: str = "http://127.0.0.1:11434", timeout: int = 120):
         self.host = host
         self.timeout = timeout
@@ -26,22 +21,24 @@ class OllamaClient:
             
         Returns:
             Ответ модели в виде строки
+            
+        Raises:
+            TimeoutError: Если Ollama не ответила за заданное время
+            ConnectionError: Если не удалось соединиться с сервером
+            RuntimeError: При других ошибках
         """
         url = urljoin(self.host, "/api/chat")
         
         payload = {
             "model": model,
             "messages": messages,
-            "stream": False
+            "stream": False,
+            "options": options or {}
         }
         
-        if options:
-            payload["options"] = options
-            
         try:
             response = self.session.post(url, json=payload, timeout=self.timeout)
             response.raise_for_status()
-            
             result = response.json()
             
             if "message" not in result or "content" not in result["message"]:
@@ -57,18 +54,7 @@ class OllamaClient:
             raise RuntimeError(f"Ошибка при запросе к Ollama: {str(e)}")
         
     def generate(self, model: str, prompt: str, system: Optional[str] = None, options: Optional[Dict[str, Any]] = None) -> str:
-        """
-        Генерирует текст на основе промпта
-        
-        Args:
-            model: Название модели
-            prompt: Входной промпт
-            system: Системное сообщение (опционально)
-            options: Дополнительные параметры
-            
-        Returns:
-            Сгенерированный текст
-        """
+        """Генерирует текст на основе промпта"""
         url = urljoin(self.host, "/api/generate")
         
         payload = {
@@ -86,15 +72,12 @@ class OllamaClient:
         try:
             response = self.session.post(url, json=payload, timeout=self.timeout)
             response.raise_for_status()
-            
             result = response.json()
             return result["response"]
         except requests.exceptions.Timeout:
             raise TimeoutError(f"Ollama не ответила за {self.timeout} сек.")
-        except requests.exceptions.ConnectionError:
-            raise ConnectionError("Не удалось соединиться с Ollama.")
         except Exception as e:
-            raise RuntimeError(f"Ошибка при генерации: {str(e)}")
+            raise RuntimeError(f"Ошибка генерации: {str(e)}")
         
     def models(self) -> List[Dict[str, Any]]:
         """Получает список доступных моделей"""
@@ -102,9 +85,8 @@ class OllamaClient:
         try:
             response = self.session.get(url, timeout=10)
             response.raise_for_status()
-            
             result = response.json()
-            return result["models"]
+            return result.get("models", [])
         except Exception as e:
             print(f"Ошибка получения списка моделей: {e}")
             return []
@@ -112,5 +94,5 @@ class OllamaClient:
     def is_model_available(self, model_name: str) -> bool:
         """Проверяет, доступна ли модель"""
         models = self.models()
-        available_models = [model["name"].split(":")[0] for model in models]
-        return model_name.split(":")[0] in available_models
+        available_names = [m.get("name", "").split(":")[0] for m in models]
+        return model_name.split(":")[0] in available_names
