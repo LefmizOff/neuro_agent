@@ -136,38 +136,9 @@ class ActionExecutor:
         return {"from": (action.start.x, action.start.y), "to": (action.end.x, action.end.y)}
     
     def _type(self, action: TypeAction) -> Dict[str, Any]:
-        """Ввод текста через буфер обмена для поддержки кириллицы."""
-        import pyperclip
-        import time
-        
-        text = action.text
-        
-        # Ограничиваем длину текста
-        if len(text) > 5000:
-            logger.warning(f"Текст обрезан до 5000 символов (было {len(text)})")
-            text = text[:5000]
-        
-        if not text.strip():
-            return {"text_length": 0, "warning": "Пустой текст"}
-        
-        try:
-            # Сохраняем текущий буфер
-            old_clip = pyperclip.paste()
-            
-            # Копируем текст в буфер
-            pyperclip.copy(text)
-            time.sleep(0.1)
-            
-            # Вставляем через Ctrl+V
-            pyautogui.hotkey('ctrl', 'v')
-            time.sleep(0.2)
-            
-            return {"text_length": len(text), "method": "clipboard"}
-        except Exception as e:
-            # Fallback на обычный ввод (не поддерживает кириллицу)
-            logger.warning(f"Буфер обмена не доступен, используем fallback: {e}")
-            pyautogui.write(text, interval=action.interval)
-            return {"text_length": len(text), "method": "fallback"}
+        """Ввод текста."""
+        pyautogui.write(action.text, interval=action.interval)
+        return {"text_length": len(action.text)}
     
     def _press_key(self, action: PressKeyAction) -> Dict[str, Any]:
         """Нажатие клавиши."""
